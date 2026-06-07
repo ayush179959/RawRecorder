@@ -9,7 +9,7 @@ Unlike generic raw capture apps that output flat, color-inaccurate, or uncalibra
 ## ⚡ The RawRecorder Advantage (Why it is better)
 
 Most third-party raw recording apps write raw sensor data directly into standard DNG files using generic Android Camera2 API tags. This default mapping often results in:
-- **Severe oversaturation** and clipping of intense hues (especially greens, cyans, and reds) in color-managed software like DaVinci Resolve and standard image viewers.
+- **Highly desaturated and dull images** lacking vibrancy and realistic color depth due to missing sensor-specific color correction matrices and profiles.
 - **Incorrect white balance coefficients** and color temperature shifts due to a lack of accurate illuminant calibration.
 - **Flat, lifeless skin tones** and wrong color space conversions because the software is guessing the camera's actual spectral response.
 
