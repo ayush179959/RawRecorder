@@ -6,13 +6,17 @@ Unlike generic raw capture apps that output flat, color-inaccurate, or uncalibra
 
 ---
 
-## 🌟 Key Features
+## ⚡ The RawRecorder Advantage (Why it is better)
 
-- **Direct RAW Capture**: Captures 10-bit or 12-bit RAW sensor output directly from the hardware pipeline.
-- **Dynamic DNG Calibration**: Automatically embeds custom Adobe Camera Profile (DCP) color matrices and lookup tables (LUTs) based on the active sensor.
-- **Multi-Lens Support**: Seamlessly switch between Main (Wide), Ultrawide, Telephoto, and Front cameras with automated camera parameter adjustment.
-- **Zero Saturation issues**: Calibrated to match standard cinema gamuts and prevent the color oversaturation common in native mobile viewers and DaVinci Resolve.
-- **Minimalist, Clean UI**: Streamlined interface focusing on clean, uncompressed image acquisition.
+Most third-party raw recording apps write raw sensor data directly into standard DNG files using generic Android Camera2 API tags. This default mapping often results in:
+- **Severe oversaturation** and clipping of intense hues (especially greens, cyans, and reds) in color-managed software like DaVinci Resolve and standard image viewers.
+- **Incorrect white balance coefficients** and color temperature shifts due to a lack of accurate illuminant calibration.
+- **Flat, lifeless skin tones** and wrong color space conversions because the software is guessing the camera's actual spectral response.
+
+### How RawRecorder Solves This:
+1. **Calibrated DCP (Digital Camera Profiles)**: RawRecorder embeds authentic, manufacturer-grade Adobe Camera Profiles (DCP) containing high-fidelity 3D Look-Up Tables (LUTs) for hue, saturation, and value (HSV) corrections, custom tone curves, and sensor matrices.
+2. **Direct Metadata Injection**: Instead of using placeholder tags, our pipeline dynamically injects exact calibration tags (`ColorMatrix1/2`, `ForwardMatrix1/2`, `AnalogBalance`, `NoiseProfile`, and exact `DefaultCrop` coordinates) directly from the device's manufacturer calibration tables.
+3. **Sensor-Matched Processing**: Each physical sensor (Main, Ultrawide, Telephoto, and Front) is profiled independently, applying distinct matrices depending on the active lens. This results in pristine, professional-grade color accuracy directly from the RAW sensor.
 
 ---
 
@@ -30,7 +34,41 @@ Currently, the app is **calibrated specifically for the Google Pixel 6 Pro**. Co
 
 ---
 
-## 🛠️ Getting Started & Build Instructions
+## 📖 Usage & Workflow Guide
+
+### 1. Capturing Raw Video
+- Open the app, grant Camera and Storage permissions.
+- Switch between lenses (Main, Ultrawide, Telephoto, Front) using the camera toggle on the UI.
+- Tap the **Record** button to begin capturing raw frames. The camera stores the raw sensor frames in our high-speed container format: `.ayushraw`.
+
+### 2. File Location on Device
+Depending on your settings (public vs. private storage), your captured `.ayushraw` files will be saved to:
+- **Private storage**: `Android/data/com.example.rawrecorder/files/`
+- **Public storage**: `Documents/RawRecorder/`
+
+### 3. Converting to Calibrated DNG
+
+You can convert the captured raw stream into standard `.dng` frames in two ways:
+
+#### A. On-Phone Conversion (In-App Gallery)
+1. Open the in-app **Gallery** inside RawRecorder.
+2. Select your captured `.ayushraw` recording.
+3. Tap **Export to DNG**.
+4. The background rendering service uses the custom `DngExtractor` to unpack the raw stream and generate a folder of fully calibrated `.dng` files on your phone's storage.
+
+#### B. On-PC Conversion (Python Utility)
+For fast batch processing and editing directly on a computer:
+1. Copy the `.ayushraw` file from your phone to your computer.
+2. Open a terminal/command prompt in the project's `desktop_tools/` directory.
+3. Run the extraction script:
+   ```bash
+   python desktop_tools/extract_dng.py /path/to/your/file.ayushraw
+   ```
+4. This script will read the embedded color matrices, forward matrices, and sensor profiles from the file header, and extract a sequence of fully-calibrated `.dng` frames into a directory named `<file_name>_frames/`. You can then import these DNGs directly into **DaVinci Resolve**, **Adobe Lightroom**, or any other professional editor.
+
+---
+
+## 🛠️ Build Instructions
 
 ### Prerequisites
 - Android Studio Koala / Ladybug or newer
