@@ -14,6 +14,7 @@ import android.opengl.EGLDisplay
 import android.opengl.EGLExt
 import android.opengl.EGLSurface
 import android.opengl.GLES20
+import android.opengl.GLES30
 import android.os.Environment
 import android.util.Log
 import android.view.Surface
@@ -140,16 +141,22 @@ object VideoRendererService {
                 progressFraction = progress.toFloat() / totalVal.toFloat()
             }
 
+            if (success && outputFile.exists()) {
+                MediaScannerConnection.scanFile(context, arrayOf(outputFile.absolutePath), null, null)
+            }
+
+            // Delete original .ayushraw file after successful export
+            if (success && file.exists()) {
+                val deleted = file.delete()
+                Log.d(TAG, "Deleted source raw file after HEVC export: $deleted")
+            }
+
             withContext(Dispatchers.Main) {
                 if (success) {
-                    Toast.makeText(context, "HEVC video exported successfully!", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "HEVC exported successfully! RAW deleted.", Toast.LENGTH_LONG).show()
                 } else {
                     Toast.makeText(context, "HEVC export failed.", Toast.LENGTH_SHORT).show()
                 }
-            }
-
-            if (success && outputFile.exists()) {
-                MediaScannerConnection.scanFile(context, arrayOf(outputFile.absolutePath), null, null)
             }
 
             isRendering = false
@@ -250,6 +257,18 @@ object VideoRendererService {
             codec.start()
 
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+            // Set rotation metadata so portrait recordings display correctly
+            val rotationDegrees = when (dngOrientationVal) {
+                3 -> 180
+                6 -> 90
+                8 -> 270
+                else -> 0
+            }
+            if (rotationDegrees != 0) {
+                muxer.setOrientationHint(rotationDegrees)
+                Log.d(TAG, "Set HEVC orientation hint: $rotationDegrees degrees")
+            }
 
             // Setup GL renderer and shaders
             renderer = GLRenderer()
@@ -394,8 +413,8 @@ object VideoRendererService {
                         
                         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, rawTextureId)
                         GLES20.glTexImage2D(
-                            GLES20.GL_TEXTURE_2D, 0, GLES20.GL_LUMINANCE, rowStride, sourceHeight,
-                            0, GLES20.GL_LUMINANCE, GLES20.GL_UNSIGNED_BYTE, payloadBuffer
+                            GLES20.GL_TEXTURE_2D, 0, GLES30.GL_R8, rowStride, sourceHeight,
+                            0, GLES30.GL_RED, GLES20.GL_UNSIGNED_BYTE, payloadBuffer
                         )
 
                         // Render frame
@@ -827,7 +846,7 @@ class CodecInputSurface(private val surface: Surface) {
         }
 
         val attrib2_list = intArrayOf(
-            EGL14.EGL_CONTEXT_CLIENT_VERSION, 2,
+            EGL14.EGL_CONTEXT_CLIENT_VERSION, 3,
             EGL14.EGL_NONE
         )
         eglContext = EGL14.eglCreateContext(eglDisplay, config, EGL14.EGL_NO_CONTEXT, attrib2_list, 0)
@@ -853,7 +872,7 @@ class CodecInputSurface(private val surface: Surface) {
             EGL14.EGL_GREEN_SIZE, greenSize,
             EGL14.EGL_BLUE_SIZE, blueSize,
             EGL14.EGL_ALPHA_SIZE, alphaSize,
-            EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+            EGL14.EGL_RENDERABLE_TYPE, 0x0040, // EGL_OPENGL_ES3_BIT_KHR
             EGL14.EGL_NONE
         )
         val configs = arrayOfNulls<EGLConfig>(1)
@@ -910,9 +929,10 @@ class GLRenderer {
     private var uColorMatrixLoc = -1
 
     private val vertexShaderCode = """
-        attribute vec4 aPosition;
-        attribute vec2 aTexCoord;
-        varying vec2 vTexCoord;
+        #version 300 es
+        in vec4 aPosition;
+        in vec2 aTexCoord;
+        out vec2 vTexCoord;
         void main() {
             gl_Position = aPosition;
             vTexCoord = aTexCoord;
@@ -920,8 +940,11 @@ class GLRenderer {
     """.trimIndent()
 
     private val fragmentShaderCode = """
+        #version 300 es
         precision highp float;
-        varying vec2 vTexCoord;
+        precision highp int;
+        in vec2 vTexCoord;
+        out vec4 fragColor;
         uniform sampler2D uTexture;
         uniform float uTexWidth;
         uniform float uTexHeight;
@@ -936,7 +959,7 @@ class GLRenderer {
 
         float getByte(int bx, int by) {
             vec2 uv = (vec2(float(bx), float(by)) + 0.5) / vec2(uTexWidth, uTexHeight);
-            return texture2D(uTexture, uv).r * 255.0;
+            return texture(uTexture, uv).r * 255.0;
         }
 
         float getRawPixel(int px, int py) {
@@ -1030,7 +1053,7 @@ class GLRenderer {
             float gLog = clamp(685.0 + 300.0 * log(max(gout, 0.0) * 0.9890396 + 0.0109604) / 2.30258509, 0.0, 1023.0);
             float bLog = clamp(685.0 + 300.0 * log(max(bout, 0.0) * 0.9890396 + 0.0109604) / 2.30258509, 0.0, 1023.0);
 
-            gl_FragColor = vec4(rLog / 1023.0, gLog / 1023.0, bLog / 1023.0, 1.0);
+            fragColor = vec4(rLog / 1023.0, gLog / 1023.0, bLog / 1023.0, 1.0);
         }
     """.trimIndent()
 
