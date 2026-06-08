@@ -134,8 +134,15 @@ class MainActivity : ComponentActivity() {
     private var usePrivateStorage by mutableStateOf(false)
     private var useGoogleMetadata by mutableStateOf(true)
 
+    // Dynamic metadata tracking values
+    private var lastPostRawBoost = 100
+    private var lastAperture = 1.8f
+    private var lastFocalLength = 4.5f
+    private var lastNoiseProfile: Array<android.util.Pair<Double, Double>>? = null
+
     // Touch Lock States
     private var is3ALocked by mutableStateOf(false)
+    private var activeMeteringRect: MeteringRectangle? = null
     private var tapX by mutableStateOf(-1f)
     private var tapY by mutableStateOf(-1f)
     private var showTapCircle by mutableStateOf(false)
@@ -523,7 +530,7 @@ class MainActivity : ComponentActivity() {
         
         val whiteLevel = pChars.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023
         
-        val preCorrectionRect = pChars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE)
+        val preCorrectionRect = pChars.get(CameraCharacteristics.SENSOR_INFO_PRE_CORRECTION_ACTIVE_ARRAY_SIZE) ?: pChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val activeRect = pChars.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
         val cropLeft = if (preCorrectionRect != null && activeRect != null) activeRect.left - preCorrectionRect.left else 0
         val cropTop = if (preCorrectionRect != null && activeRect != null) activeRect.top - preCorrectionRect.top else 0
@@ -563,11 +570,14 @@ class MainActivity : ComponentActivity() {
             return arr
         }
         
-        val dynamicCm1 = toIntArray(pChars.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM1))
-        val dynamicCm2 = toIntArray(pChars.get(CameraCharacteristics.SENSOR_COLOR_TRANSFORM2))
-        val dynamicFm1 = toIntArray(pChars.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX1))
-        val dynamicFm2 = toIntArray(pChars.get(CameraCharacteristics.SENSOR_FORWARD_MATRIX2))
-        
+        val fallbackApertures = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_APERTURES)
+        val defaultAperture = fallbackApertures?.firstOrNull() ?: 1.8f
+        val currentAperture = if (lastAperture > 0f) lastAperture else defaultAperture
+
+        val fallbackFocalLengths = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+        val defaultFocalLength = fallbackFocalLengths?.firstOrNull() ?: 4.5f
+        val currentFocalLength = if (lastFocalLength > 0f) lastFocalLength else defaultFocalLength
+
         val sensorType = when (lens.name) {
             "UW" -> 1
             "T" -> 2
@@ -575,12 +585,134 @@ class MainActivity : ComponentActivity() {
             else -> 0
         }
 
+        val dynamicCm1: IntArray
+        val dynamicCm2: IntArray
+        val dynamicFm1: IntArray
+        val dynamicFm2: IntArray
+        val ill1Val: Int
+        val ill2Val: Int
+        val cal1 = intArrayOf(
+            1, 1, 0, 1, 0, 1,
+            0, 1, 1, 1, 0, 1,
+            0, 1, 0, 1, 1, 1
+        )
+        val cal2 = intArrayOf(
+            1, 1, 0, 1, 0, 1,
+            0, 1, 1, 1, 0, 1,
+            0, 1, 0, 1, 1, 1
+        )
+        val baselineExpNum: Int
+        val baselineExpDen: Int
+        val noiseProfileArray = FloatArray(8)
+
+        when (sensorType) {
+            1 -> { // Ultrawide
+                dynamicCm1 = intArrayOf(14178, 10000, -8720, 10000, 688, 10000, -2895, 10000, 11364, 10000, 1730, 10000, 110, 10000, 814, 10000, 5508, 10000)
+                dynamicCm2 = intArrayOf(11835, 10000, -5488, 10000, -1032, 10000, -3371, 10000, 11891, 10000, 1648, 10000, -194, 10000, 1235, 10000, 4748, 10000)
+                dynamicFm1 = intArrayOf(3777, 10000, 4906, 10000, 960, 10000, 1585, 10000, 8136, 10000, 278, 10000, 459, 10000, 16, 10000, 7775, 10000)
+                dynamicFm2 = intArrayOf(3806, 10000, 4501, 10000, 1336, 10000, 1773, 10000, 7842, 10000, 385, 10000, 652, 10000, 6, 10000, 7593, 10000)
+                ill1Val = 17
+                ill2Val = 21
+                baselineExpNum = 12
+                baselineExpDen = 100
+                floatArrayOf(
+                    0.0004338437f, 4.3466407e-6f,
+                    0.0002172339f, 2.2114516e-6f,
+                    0.0002172339f, 2.2114516e-6f,
+                    0.0004287199f, 4.3406994e-6f
+                ).copyInto(noiseProfileArray)
+            }
+            2 -> { // Telephoto
+                dynamicCm1 = intArrayOf(12163, 10000, -5088, 10000, -692, 10000, -2296, 10000, 10998, 10000, 1473, 10000, 211, 10000, 1016, 10000, 4655, 10000)
+                dynamicCm2 = intArrayOf(8380, 10000, -1926, 10000, -623, 10000, -4094, 10000, 12822, 10000, 1364, 10000, -1193, 10000, 2655, 10000, 3949, 10000)
+                dynamicFm1 = intArrayOf(4222, 10000, 4040, 10000, 1381, 10000, 1880, 10000, 7702, 10000, 418, 10000, 571, 10000, 5, 10000, 7675, 10000)
+                dynamicFm2 = intArrayOf(5208, 10000, 3320, 10000, 1116, 10000, 2917, 10000, 6733, 10000, 350, 10000, 1702, 10000, 13, 10000, 6536, 10000)
+                ill1Val = 17
+                ill2Val = 21
+                baselineExpNum = 267
+                baselineExpDen = 100
+                floatArrayOf(
+                    0.00017274475f, 6.8975623e-7f,
+                    8.3773375e-5f, 3.2082875e-7f,
+                    8.3773375e-5f, 3.2082875e-7f,
+                    0.0001556827f, 5.8859496e-7f
+                ).copyInto(noiseProfileArray)
+            }
+            3 -> { // Front
+                dynamicCm1 = intArrayOf(20174, 10000, -5979, 10000, -11229, 10000, -19432, 10000, 43771, 10000, -21631, 10000, -2889, 10000, 5882, 10000, 8368, 10000)
+                dynamicCm2 = intArrayOf(12128, 10000, -5577, 10000, -1067, 10000, -3077, 10000, 11648, 10000, 1599, 10000, -121, 10000, 1501, 10000, 5141, 10000)
+                dynamicFm1 = intArrayOf(5917, 10000, -885, 10000, 4611, 10000, 2729, 10000, 2453, 10000, 4819, 10000, 485, 10000, -4309, 10000, 12075, 10000)
+                dynamicFm2 = intArrayOf(3638, 10000, 4646, 10000, 1359, 10000, 1621, 10000, 7989, 10000, 390, 10000, 543, 10000, 32, 10000, 7676, 10000)
+                ill1Val = 17
+                ill2Val = 21
+                baselineExpNum = 0
+                baselineExpDen = 100
+                floatArrayOf(
+                    2.0539945e-5f, 2.1160035e-7f,
+                    1.4857906e-5f, 1.2181445e-7f,
+                    1.4857906e-5f, 1.2181445e-7f,
+                    2.0451544e-5f, 2.11745e-7f
+                ).copyInto(noiseProfileArray)
+            }
+            else -> { // Main
+                dynamicCm1 = intArrayOf(11234, 10000, -5774, 10000, 83, 10000, -3535, 10000, 12410, 10000, 1210, 10000, -303, 10000, 2176, 10000, 5922, 10000)
+                dynamicCm2 = intArrayOf(10662, 10000, -4641, 10000, -954, 10000, -3284, 10000, 11970, 10000, 1451, 10000, -170, 10000, 1989, 10000, 5182, 10000)
+                dynamicFm1 = intArrayOf(4078, 10000, 4619, 10000, 946, 10000, 2358, 10000, 7358, 10000, 284, 10000, 1183, 10000, 4, 10000, 7063, 10000)
+                dynamicFm2 = intArrayOf(3666, 10000, 4641, 10000, 1335, 10000, 1639, 10000, 7979, 10000, 383, 10000, 477, 10000, 42, 10000, 7733, 10000)
+                ill1Val = 17
+                ill2Val = 21
+                baselineExpNum = 5
+                baselineExpDen = 100
+                floatArrayOf(
+                    2.0539945e-5f, 2.1160035e-7f,
+                    1.4857906e-5f, 1.2181445e-7f,
+                    1.4857906e-5f, 1.2181445e-7f,
+                    2.0451544e-5f, 2.11745e-7f
+                ).copyInto(noiseProfileArray)
+            }
+        }
+
+        val lensIntrinsic = pChars.get(CameraCharacteristics.LENS_INTRINSIC_CALIBRATION) ?: floatArrayOf(0f, 0f, 0f, 0f, 0f)
+
+        val lensDistortion = FloatArray(5)
+        val ld = pChars.get(CameraCharacteristics.LENS_DISTORTION)
+        if (ld != null && ld.size >= 5) {
+            ld.copyInto(lensDistortion, 0, 0, 5)
+        } else {
+            val lrd = pChars.get(CameraCharacteristics.LENS_RADIAL_DISTORTION)
+            if (lrd != null && lrd.size >= 6) {
+                lensDistortion[0] = lrd[0]
+                lensDistortion[1] = lrd[1]
+                lensDistortion[2] = lrd[2]
+                lensDistortion[3] = lrd[4]
+                lensDistortion[4] = lrd[5]
+            }
+        }
+
+        val deviceMake = android.os.Build.MANUFACTURER ?: "Google"
+        val deviceModel = android.os.Build.MODEL ?: "Pixel"
+
+        val preWidth = preCorrectionRect?.width() ?: res.cropWidth
+        val preHeight = preCorrectionRect?.height() ?: res.cropHeight
+
         rawSpoolerEngine = RawSpoolerEngine(
             res.cropWidth, res.cropHeight, res.sourceHeight, lens.cfaPattern, 
             dynamicCm1, dynamicCm2, dynamicFm1, dynamicFm2, 
-            ill1, ill2,
+            ill1Val, ill2Val,
             blackLevelArray, whiteLevel, cropLeft, cropTop, cropWidth, cropHeight,
-            sensorType
+            sensorType,
+            cal1, cal2,
+            baselineExpNum,
+            baselineExpDen,
+            noiseProfileArray,
+            lensIntrinsic,
+            lensDistortion,
+            currentAperture,
+            currentFocalLength,
+            deviceMake,
+            deviceModel,
+            preWidth,
+            preHeight
         )
         rawSpoolerEngine?.prepareEnginePipeline()
 
@@ -646,6 +778,10 @@ class MainActivity : ComponentActivity() {
                 builder.set(CaptureRequest.CONTROL_AE_LOCK, true)
                 builder.set(CaptureRequest.CONTROL_AWB_LOCK, true)
                 builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                activeMeteringRect?.let {
+                    builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(it))
+                    builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(it))
+                }
             } else {
                 builder.set(CaptureRequest.CONTROL_AE_LOCK, false)
                 builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
@@ -670,15 +806,48 @@ class MainActivity : ComponentActivity() {
                 if (focusRect != null) {
                     builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
                     builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(focusRect))
+                    builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(focusRect))
+                    builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                    
+                    when (stabilityMode) {
+                        StabilityMode.OFF -> {
+                            builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                        }
+                        StabilityMode.OIS -> {
+                            builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF)
+                        }
+                        StabilityMode.EIS -> {
+                            builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF)
+                            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                        }
+                        StabilityMode.OIS_EIS -> {
+                            builder.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE, CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_ON)
+                            builder.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE, CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_ON)
+                        }
+                    }
+                    
+                    session.setRepeatingRequest(builder.build(), captureCallback, null)
+                    
                     builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
                     session.capture(builder.build(), captureCallback, null)
+                    
                     builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+                    return
                 } else {
-                    if (isAutoFocus) {
-                        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                    val currentRect = activeMeteringRect
+                    if (currentRect != null) {
+                        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+                        builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(currentRect))
+                        builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(currentRect))
                     } else {
-                        builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                        builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+                        if (isAutoFocus) {
+                            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
+                        } else {
+                            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
+                            builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
+                        }
                     }
                 }
             }
@@ -792,31 +961,83 @@ class MainActivity : ComponentActivity() {
             val iso = result.get(CaptureResult.SENSOR_SENSITIVITY) ?: isoValue
             val fd = result.get(CaptureResult.LENS_FOCUS_DISTANCE) ?: focusDistance
             rawSpoolerEngine?.updateLiveCaptureParameters(expTime, iso, fd)
+            
+            val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
+            if (boost != null) lastPostRawBoost = boost
+            val aperture = result.get(CaptureResult.LENS_APERTURE)
+            if (aperture != null) lastAperture = aperture
+            val focalLength = result.get(CaptureResult.LENS_FOCAL_LENGTH)
+            if (focalLength != null) lastFocalLength = focalLength
+            val noise = result.get(CaptureResult.SENSOR_NOISE_PROFILE)
+            if (noise != null) lastNoiseProfile = noise
         }
     }
 
-    private fun handleTouchToFocus(x: Float, y: Float) {
+    private fun handleTouchToFocus(x: Float, y: Float, viewWidthPx: Float, viewHeightPx: Float) {
         val lens = selectedLens ?: return
-        val arraySize = lens.activeArraySize
-        val viewAspect = viewWidth.toFloat() / max(1, viewHeight).toFloat()
-        val sensorAspect = arraySize.width().toFloat() / max(1, arraySize.height()).toFloat()
+        val pChars = cameraManager.getCameraCharacteristics(lens.physicalId)
+        val sensorOrientation = pChars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+        val cropRegion = getScalerCropRegion()
+        
+        // 1. Calculate normalized touch coordinates (0f..1f) relative to the visible preview on screen
+        val sensorAspect = cropRegion.width().toFloat() / max(1, cropRegion.height()).toFloat()
+        
+        val deviceRotationDegrees = getDeviceRotationDegrees()
+        val relativeRotation = (sensorOrientation - deviceRotationDegrees + 360) % 360
+        val isRotated = (relativeRotation == 90 || relativeRotation == 270)
+        
+        val displayAspect = if (isRotated) 1f / sensorAspect else sensorAspect
+        val viewAspect = viewWidthPx / max(1f, viewHeightPx)
+        
+        var activeWidth = viewWidthPx
+        var activeHeight = viewHeightPx
         var xOffset = 0f
         var yOffset = 0f
-        var activeWidth = viewWidth.toFloat()
-        var activeHeight = viewHeight.toFloat()
-        if (viewAspect > sensorAspect) {
-            activeWidth = viewHeight * sensorAspect
-            xOffset = (viewWidth - activeWidth) / 2f
+        
+        if (viewAspect > displayAspect) {
+            activeWidth = viewHeightPx * displayAspect
+            xOffset = (viewWidthPx - activeWidth) / 2f
         } else {
-            activeHeight = viewWidth / sensorAspect
-            yOffset = (viewHeight - activeHeight) / 2f
+            activeHeight = viewWidthPx / displayAspect
+            yOffset = (viewHeightPx - activeHeight) / 2f
         }
-        val normalizedX = ((x - xOffset) / activeWidth).coerceIn(0f, 1f)
-        val normalizedY = ((y - yOffset) / activeHeight).coerceIn(0f, 1f)
-        val sensorX = (normalizedX * arraySize.width()).toInt() + arraySize.left
-        val sensorY = (normalizedY * arraySize.height()).toInt() + arraySize.top
+        
+        val nx = ((x - xOffset) / activeWidth).coerceIn(0f, 1f)
+        val ny = ((y - yOffset) / activeHeight).coerceIn(0f, 1f)
+        
+        // 2. Map normalized touch coordinates to the sensor crop region based on rotation
+        var rx = nx
+        var ry = ny
+        when (relativeRotation) {
+            90 -> {
+                rx = ny
+                ry = 1.0f - nx
+            }
+            180 -> {
+                rx = 1.0f - nx
+                ry = 1.0f - ny
+            }
+            270 -> {
+                rx = 1.0f - ny
+                ry = nx
+            }
+        }
+        
+        // 3. Map rx/ry to absolute sensor coordinates in cropRegion
+        val sensorX = cropRegion.left + (rx * cropRegion.width()).toInt()
+        val sensorY = cropRegion.top + (ry * cropRegion.height()).toInt()
+        val finalSensorX = sensorX.coerceIn(cropRegion.left, cropRegion.right)
+        val finalSensorY = sensorY.coerceIn(cropRegion.top, cropRegion.bottom)
+        
         val focusAreaSize = 150
-        val rect = MeteringRectangle(max(0, sensorX - focusAreaSize), max(0, sensorY - focusAreaSize), focusAreaSize * 2, focusAreaSize * 2, MeteringRectangle.METERING_WEIGHT_MAX)
+        val rect = MeteringRectangle(
+            max(0, finalSensorX - focusAreaSize), 
+            max(0, finalSensorY - focusAreaSize), 
+            focusAreaSize * 2, 
+            focusAreaSize * 2, 
+            MeteringRectangle.METERING_WEIGHT_MAX
+        )
+        activeMeteringRect = rect
         updateRepeatingRequest(rect)
     }
 
@@ -928,13 +1149,13 @@ class MainActivity : ComponentActivity() {
                                             delay(1000)
                                             showTapCircle = false
                                         }
-                                        handleTouchToFocus(offset.x, offset.y)
+                                        handleTouchToFocus(offset.x, offset.y, size.width.toFloat(), size.height.toFloat())
                                     },
                                     onLongPress = { offset ->
                                         tapX = offset.x
                                         tapY = offset.y
                                         showTapCircle = true
-                                        handleTouchToFocus(offset.x, offset.y)
+                                        handleTouchToFocus(offset.x, offset.y, size.width.toFloat(), size.height.toFloat())
                                         is3ALocked = true
                                         updateRepeatingRequest()
                                     }
@@ -953,7 +1174,6 @@ class MainActivity : ComponentActivity() {
                                                 evAccumulator -= evInt
                                                 updateRepeatingRequest()
                                                 saveSettings()
-                                                
                                                 showEvFeedback = true
                                                 evFeedbackTimerJob?.cancel()
                                                 evFeedbackTimerJob = lifecycleScope.launch {
@@ -1156,7 +1376,7 @@ class MainActivity : ComponentActivity() {
                             )
                             ParameterCard("FOCUS", focusStr, activeDragMenu == "FOCUS",
                                 onClick = { activeDragMenu = if (activeDragMenu == "FOCUS") "" else "FOCUS" },
-                                onDoubleTap = { isAutoFocus = true; updateRepeatingRequest(); saveSettings() }
+                                onDoubleTap = { isAutoFocus = true; activeMeteringRect = null; updateRepeatingRequest(); saveSettings() }
                             )
                             ParameterCard("TEMP", tempStr, activeDragMenu == "TEMP",
                                 onClick = { activeDragMenu = if (activeDragMenu == "TEMP") "" else "TEMP" },
@@ -1386,7 +1606,7 @@ class MainActivity : ComponentActivity() {
                         )
                         ParameterCard("FOCUS", focusStr, activeDragMenu == "FOCUS",
                             onClick = { activeDragMenu = if (activeDragMenu == "FOCUS") "" else "FOCUS" },
-                            onDoubleTap = { isAutoFocus = true; updateRepeatingRequest(); saveSettings() }
+                            onDoubleTap = { isAutoFocus = true; activeMeteringRect = null; updateRepeatingRequest(); saveSettings() }
                         )
                         ParameterCard("TEMP", tempStr, activeDragMenu == "TEMP",
                             onClick = { activeDragMenu = if (activeDragMenu == "TEMP") "" else "TEMP" },
@@ -1696,6 +1916,7 @@ class MainActivity : ComponentActivity() {
                                     .border(if (isAutoFocus) 0.dp else 1.dp, Color.White.copy(alpha = 0.5f), RoundedCornerShape(14.dp))
                                     .clickable {
                                         isAutoFocus = true
+                                        activeMeteringRect = null
                                         updateRepeatingRequest()
                                         saveSettings()
                                     }
@@ -1714,6 +1935,7 @@ class MainActivity : ComponentActivity() {
                                 value = focusDistance,
                                 onValueChange = {
                                     isAutoFocus = false
+                                    activeMeteringRect = null
                                     focusDistance = it
                                     updateRepeatingRequest()
                                     saveSettings()
@@ -1777,6 +1999,7 @@ class MainActivity : ComponentActivity() {
                                         .border(0.5.dp, if (isSelected) Color.Transparent else Color(0x22FFFFFF), RoundedCornerShape(12.dp))
                                         .clickable {
                                             isAutoFocus = false
+                                            activeMeteringRect = null
                                             focusDistance = dist
                                             updateRepeatingRequest()
                                             saveSettings()
@@ -1934,14 +2157,30 @@ class MainActivity : ComponentActivity() {
                             val dir = if (usePrivateStorage) getExternalFilesDir(null) else Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
                             dir?.mkdirs()
                             val prefix = "${captureName}_"
-                            val existingFiles = dir?.listFiles { _, name -> name.startsWith(prefix) && name.endsWith(".ayushraw") }
                             var maxIndex = 0
-                            existingFiles?.forEach { f ->
-                                val name = f.name
-                                val numStr = name.removePrefix(prefix).removeSuffix(".ayushraw")
-                                val num = numStr.toIntOrNull()
-                                if (num != null && num > maxIndex) {
-                                    maxIndex = num
+                            val scanDirs = mutableListOf<File>()
+                            getExternalFilesDir(null)?.let { scanDirs.add(it) }
+                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)?.let { scanDirs.add(it) }
+                            for (sDir in scanDirs) {
+                                if (!sDir.exists()) continue
+                                val rawFiles = sDir.listFiles { _, name -> name.startsWith(prefix) && name.endsWith(".ayushraw") }
+                                rawFiles?.forEach { f ->
+                                    val numStr = f.name.removePrefix(prefix).removeSuffix(".ayushraw")
+                                    val num = numStr.toIntOrNull()
+                                    if (num != null && num > maxIndex) {
+                                        maxIndex = num
+                                    }
+                                }
+                                val rawRecorderDir = File(sDir, "RawRecorder")
+                                if (rawRecorderDir.exists()) {
+                                    val subDirs = rawRecorderDir.listFiles { f -> f.isDirectory && f.name.startsWith(prefix) }
+                                    subDirs?.forEach { d ->
+                                        val numStr = d.name.removePrefix(prefix)
+                                        val num = numStr.toIntOrNull()
+                                        if (num != null && num > maxIndex) {
+                                            maxIndex = num
+                                        }
+                                    }
                                 }
                             }
                             val nextIndex = maxIndex + 1

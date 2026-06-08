@@ -76,6 +76,7 @@ def main():
         ("ARRI Wide Gamut 3", ccm_arri, "ARRI LogC3", "arri_logc3", True),
         ("REDWideGamutRGB", ccm_red, "Log3G10", "red_log3g10", True),
         ("Sony S-Gamut3.Cine", ccm_sony, "S-Log3", "sony_slog3", True),
+        ("Cineon Film Log (sRGB)", ccm_srgb, "Cineon", "cineon_log", True),
         ("sRGB (Linear to Display)", ccm_srgb, "sRGB", "srgb_display", False)
     ]
     

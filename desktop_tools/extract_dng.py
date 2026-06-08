@@ -2,6 +2,7 @@ import os
 import struct
 import sys
 import numpy as np
+import math
 
 def process_file(file_path):
     print(f"Processing {file_path}...")
@@ -9,32 +10,45 @@ def process_file(file_path):
     os.makedirs(output_dir, exist_ok=True)
     
     with open(file_path, 'rb') as f:
-        global_header = f.read(512)
-        if len(global_header) < 512 or global_header[:8] != b'AYUSHRAW':
+        global_header = f.read(1024)
+        if len(global_header) < 1024 or global_header[:8] != b'AYUSHRAW':
             print("Invalid global header")
             return
             
         (width, height, row_stride, cfa_pattern, bit_depth) = struct.unpack('<5I', global_header[8:28])
         ill1, ill2 = struct.unpack('<2I', global_header[28:36])
-        packed_cm1 = global_header[36:36+72]
-        packed_cm2 = global_header[108:108+72]
-        packed_fm1 = global_header[180:180+72]
-        packed_fm2 = global_header[252:252+72]
+        packed_cm1 = global_header[36:108]
+        packed_cm2 = global_header[108:180]
+        packed_fm1 = global_header[180:252]
+        packed_fm2 = global_header[252:324]
         
-        bl_pattern = struct.unpack('<4I', global_header[324:340])
-        white_level = struct.unpack('<I', global_header[340:344])[0]
-        crop_left, crop_top, crop_width, crop_height = struct.unpack('<4I', global_header[344:360])
-        try:
-            source_height, dng_orientation = struct.unpack('<2I', global_header[360:368])
-            if source_height <= 0 or source_height > 10000:
-                source_height = height
-            if dng_orientation not in (1, 3, 6, 8):
-                dng_orientation = 1
-        except Exception:
+        packed_cal1 = global_header[324:396]
+        packed_cal2 = global_header[396:468]
+        
+        bl_pattern = struct.unpack('<4I', global_header[468:484])
+        white_level = struct.unpack('<I', global_header[484:488])[0]
+        crop_left, crop_top, crop_width, crop_height = struct.unpack('<4I', global_header[488:504])
+        
+        source_height, dng_orientation, sensor_type = struct.unpack('<3I', global_header[504:516])
+        if source_height <= 0 or source_height > 10000:
             source_height = height
+        if dng_orientation not in (1, 3, 6, 8):
             dng_orientation = 1
+            
+        baseline_exp_num, baseline_exp_den = struct.unpack('<2i', global_header[516:524])
+        noise_profile = struct.unpack('<8f', global_header[524:556])
+        lens_intrinsic = struct.unpack('<5f', global_header[556:576])
+        lens_distortion = struct.unpack('<5f', global_header[576:596])
+        lens_aperture, lens_focal_length = struct.unpack('<2f', global_header[596:604])
         
-        print(f"Detected: {width}x{height}, Stride: {row_stride}, CFA: {cfa_pattern}, Depth: {bit_depth}-bit, SourceHeight: {source_height}, Orientation: {dng_orientation}")
+        device_make_bytes = global_header[604:636]
+        device_make = device_make_bytes.split(b'\x00')[0].decode('ascii', errors='ignore').strip()
+        device_model_bytes = global_header[636:668]
+        device_model = device_model_bytes.split(b'\x00')[0].decode('ascii', errors='ignore').strip()
+        
+        pre_width, pre_height = struct.unpack('<2I', global_header[668:676])
+        
+        print(f"Detected: {width}x{height}, Stride: {row_stride}, CFA: {cfa_pattern}, Depth: {bit_depth}-bit, PreCorrect: {pre_width}x{pre_height}, Make: {device_make}, Model: {device_model}")
         
         cfa_map = {
             0: (0, 1, 1, 2), # RGGB
@@ -45,95 +59,55 @@ def process_file(file_path):
         cfa_tuple = cfa_map.get(cfa_pattern, (1, 2, 0, 1))
 
         payload_size = source_height * row_stride
-        OUTPUT_BIT_DEPTH = 10
+        OUTPUT_BIT_DEPTH = 16
         
-        if OUTPUT_BIT_DEPTH == 16:
-            active_black_level = (4096, 4096, 4096, 4096)
-            active_white_level = 65472
-        else:
-            active_black_level = bl_pattern
-            active_white_level = white_level
+        active_black_level = bl_pattern
+        active_white_level = white_level
         
         valid_width = width
-        # DNG uses 16-bit unpacked format
-        out_row_stride = valid_width * 2
         
-        # Use dynamic crop geometry from CameraCharacteristics
         crop_origin_x = crop_left
         crop_origin_y = crop_top
 
+        # Clean Make, Model, and UniqueCameraModel strings
+        final_make = device_make if device_make else "Google"
+        final_model = device_model if device_model else "Pixel"
+        device_make_tag = final_make.encode('ascii') + b'\0'
+        device_model_tag = final_model.encode('ascii') + b'\0'
+        unique_model_tag = (final_make + " " + final_model).encode('ascii') + b'\0'
+
         base_tags = [
-            (254, 'I', 1, 0),                 # NewSubfileType = 0
-            (274, 'H', 1, dng_orientation),                 # Orientation
-            (277, 'H', 1, 1),                 # SamplesPerPixel = 1
-            (282, 'rational', 1, (300, 1)),   # XResolution = 300
-            (283, 'rational', 1, (300, 1)),   # YResolution = 300
-            (271, 's', 7, b"Google\0"),                      # Make
-            (272, 's', 12, b"Pixel 6 Pro\0"),                # Model
-            (305, 's', 16, b"MotionCam Tools\0"), # Software
-            (33421, 'H', 2, (2, 2)),          # CFARepeatPatternDim = 2x2
-            (33422, 'B', 4, cfa_tuple),       # CFAPattern
-            (50706, 'B', 4, (1, 4, 0, 0)),    # DNGVersion = 1.4.0.0
-            (50707, 'B', 4, (1, 1, 0, 0)),    # DNGBackwardVersion = 1.1.0.0
-            (50708, 's', 19, b"Google Pixel 6 Pro\0"),       # UniqueCameraModel
-            (50711, 'H', 1, 1),               # CFALayout = 1
-            (50713, 'H', 2, (2, 2)),          # BlackLevelRepeatDim = 2x2
-            (50714, 'H', 4, active_black_level), # BlackLevel
-            (50717, 'I', 1, active_white_level),  # WhiteLevel
-            (50721, 'srational', 9, packed_cm1), # ColorMatrix1
-            (50722, 'srational', 9, packed_cm2), # ColorMatrix2
-            (50778, 'H', 1, ill1),            # CalibrationIlluminant1
-            (50779, 'H', 1, ill2),            # CalibrationIlluminant2
-            (50964, 'srational', 9, packed_fm1), # ForwardMatrix1
-            (50965, 'srational', 9, packed_fm2), # ForwardMatrix2
-            (50829, 'I', 4, (0, 0, height, width)), # ActiveArea (top, left, bottom, right)
-            (50719, 'rational', 2, (crop_origin_x, 1, crop_origin_y, 1)), # DefaultCropOrigin (h, v)
-            (50720, 'rational', 2, (crop_width, 1, crop_height, 1)), # DefaultCropSize (w, h)
-            (51043, 'B', 8, (0, 0, 0, 0, 0, 0, 0, 0)), # TimeCodes
-            (51044, 'srational', 1, (30000, 1000)), # FrameRate
-            (50730, 'srational', 1, (104, 100)), # BaselineExposure (+1.04 EV)
+            (254, 'I', 1, 0),                                           # NewSubfileType = 0
+            (274, 'H', 1, dng_orientation),                             # Orientation
+            (277, 'H', 1, 1),                                           # SamplesPerPixel = 1
+            (282, 'rational', 1, (300, 1)),                             # XResolution = 300
+            (283, 'rational', 1, (300, 1)),                             # YResolution = 300
+            (305, 's', 16, b"RawRecorder\0\0\0\0\0"),                   # Software
+            (33421, 'H', 2, (2, 2)),                                    # CFARepeatPatternDim = 2x2
+            (33422, 'B', 4, cfa_tuple),                                 # CFAPattern
+            (50706, 'B', 4, (1, 4, 0, 0)),                              # DNGVersion = 1.4.0.0
+            (50708, 's', len(unique_model_tag), unique_model_tag),      # UniqueCameraModel
+            (50713, 'H', 2, (2, 2)),                                    # BlackLevelRepeatDim = 2x2
+            (50714, 'H', 4, active_black_level),                        # BlackLevel
+            (50717, 'I', 1, active_white_level),                        # WhiteLevel
+            (50721, 'srational', 9, packed_cm1),                        # ColorMatrix1
+            (50722, 'srational', 9, packed_cm2),                        # ColorMatrix2
+            (50723, 'srational', 9, packed_cal1),                       # CameraCalibration1
+            (50724, 'srational', 9, packed_cal2),                       # CameraCalibration2
+            (50778, 'H', 1, ill1),                                      # CalibrationIlluminant1
+            (50779, 'H', 1, ill2),                                      # CalibrationIlluminant2
+            (50964, 'srational', 9, packed_fm1),                        # ForwardMatrix1
+            (50965, 'srational', 9, packed_fm2),                        # ForwardMatrix2
+            (50829, 'I', 4, (0, 0, height, width)),                     # ActiveArea (top, left, bottom, right)
+            (51043, 'B', 8, (0, 0, 0, 0, 0, 0, 0, 0)),                  # TimeCodes
+            (51044, 'srational', 1, (30000, 1000)),                     # FrameRate
             
-            # Core Metadata Tags (to align with Pixel Camera DNG behavior)
-            (50727, 'rational', 3, (1, 1, 1, 1, 1, 1)),     # AnalogBalance (1.0, 1.0, 1.0)
-            (50731, 'rational', 1, (1, 1)),                 # BaselineNoise (1.0)
-            (50732, 'rational', 1, (1, 1)),                 # BaselineSharpness (1.0)
-            (51041, 'f', 6, (1.34395988e-4, 5.8752613e-7, 7.548273e-5, 2.4646738e-7, 1.3451263e-4, 5.9602803e-7)), # NoiseProfile
-            (51110, 'I', 1, 1),                      # DefaultBlackRender
+            (50727, 'rational', 3, (1, 1, 1, 1, 1, 1)),                 # AnalogBalance (1.0, 1.0, 1.0)
             (50781, 'B', 16, b"\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f\x10") # RawDataUniqueID
         ]
 
-        # Load profile assets if directory exists
-        assets_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profile_assets")
-        if os.path.isdir(assets_dir):
-            try:
-                def load_bin(filename):
-                    with open(os.path.join(assets_dir, filename), 'rb') as bin_f:
-                        return bin_f.read()
-                
-                sig_bytes = load_bin("profile_sig.bin")
-                name_bytes = load_bin("profile_name.bin")
-                hs_dims_bytes = load_bin("profile_hs_dims.bin")
-                hs1_bytes = load_bin("profile_hs1.bin")
-                hs2_bytes = load_bin("profile_hs2.bin")
-                tone_bytes = load_bin("profile_tone.bin")
-                policy_bytes = load_bin("profile_embed_policy.bin")
-                look_dims_bytes = load_bin("profile_look_dims.bin")
-                look_bytes = load_bin("profile_look.bin")
-                
-                base_tags.extend([
-                    (50932, 'B', len(sig_bytes), sig_bytes),       # ProfileCalibrationSignature
-                    (50936, 'B', len(name_bytes), name_bytes),     # ProfileName
-                    (50937, 'I', len(hs_dims_bytes)//4, hs_dims_bytes), # ProfileHueSatMapDims
-                    (50938, 'f', len(hs1_bytes)//4, hs1_bytes),    # ProfileHueSatMapData1
-                    (50939, 'f', len(hs2_bytes)//4, hs2_bytes),    # ProfileHueSatMapData2
-                    (50940, 'f', len(tone_bytes)//4, tone_bytes),  # ProfileToneCurve
-                    (50941, 'I', len(policy_bytes)//4, policy_bytes), # ProfileEmbedPolicy
-                    (50981, 'I', len(look_dims_bytes)//4, look_dims_bytes), # ProfileLookTableDims
-                    (50982, 'f', len(look_bytes)//4, look_bytes),  # ProfileLookTableData
-                ])
-                print("Embedded Google Camera Profile tags from profile_assets folder.")
-            except Exception as e:
-                print(f"Warning: Could not load profile assets: {e}")
+        if lens_focal_length > 0.0 and lens_aperture > 0.0:
+            base_tags.append((50827, 'rational', 4, (int(lens_focal_length * 100), 100, int(lens_focal_length * 100), 100, int(lens_aperture * 100), 100, int(lens_aperture * 100), 100)))
 
         frame_idx = 0
         while True:
@@ -143,7 +117,6 @@ def process_file(file_path):
                 
             (timestamp, shutter, iso, focus, idx, g_red, g_green_even, g_green_odd, g_blue) = struct.unpack('<qQififfff', frame_header[:44])
             
-            # Prevent DivisionByZero by adding a small epsilon or falling back to 1.0
             g_red = g_red if g_red > 0.001 else 1.0
             g_green_even = g_green_even if g_green_even > 0.001 else 1.0
             g_green_odd = g_green_odd if g_green_odd > 0.001 else 1.0
@@ -154,17 +127,12 @@ def process_file(file_path):
                 print(f"Warning: Reached end of file at frame {frame_idx} with incomplete payload!")
                 break
                 
-            # Unpack RAW10
-            # raw_payload is source_height * row_stride bytes.
-            # Convert to numpy array of uint8
             raw_data = np.frombuffer(raw_payload, dtype=np.uint8).reshape((source_height, row_stride))
             
-            # The valid data is in the first (width * 5 // 4) bytes of each row
             valid_bytes = (valid_width * 5) // 4
             crop_start_row = ((source_height - height) // 2) & -2
             valid_data = raw_data[crop_start_row:crop_start_row+height, :valid_bytes]
             
-            # Unpack
             b0 = valid_data[:, 0::5].astype(np.uint16)
             b1 = valid_data[:, 1::5].astype(np.uint16)
             b2 = valid_data[:, 2::5].astype(np.uint16)
@@ -172,11 +140,10 @@ def process_file(file_path):
             b4 = valid_data[:, 4::5].astype(np.uint16)
             
             if OUTPUT_BIT_DEPTH == 16:
-                # Unpack and shift to 16-bit range (<< 6)
-                p0 = ((b0 << 2) | ((b4 >> 0) & 0x03)) << 6
-                p1 = ((b1 << 2) | ((b4 >> 2) & 0x03)) << 6
-                p2 = ((b2 << 2) | ((b4 >> 4) & 0x03)) << 6
-                p3 = ((b3 << 2) | ((b4 >> 6) & 0x03)) << 6
+                p0 = (b0 << 2) | ((b4 >> 0) & 0x03)
+                p1 = (b1 << 2) | ((b4 >> 2) & 0x03)
+                p2 = (b2 << 2) | ((b4 >> 4) & 0x03)
+                p3 = (b3 << 2) | ((b4 >> 6) & 0x03)
                 
                 unpacked = np.empty((height, valid_width), dtype=np.uint16)
                 unpacked[:, 0::4] = p0
@@ -216,7 +183,6 @@ def process_file(file_path):
                 g_gain = max(0.0001, (g_green_even + g_green_odd) / 2.0)
                 b_gain = max(0.0001, g_blue)
                 
-                # AsShotNeutral needs to be the raw values of a neutral target, normalized to G=1.0
                 R_val = g_gain / r_gain
                 B_val = g_gain / b_gain
                 
@@ -224,9 +190,7 @@ def process_file(file_path):
                 all_tags = base_tags.copy()
                 all_tags.append(dynamic_neutral_tag)
                 
-                # Dynamic exposure and ISO
                 all_tags.append((34855, 'H', 1, iso))
-                # Prevent 32-bit unsigned rational overflow
                 exp_sec = shutter / 1000000000.0
                 exp_den = 1000000
                 exp_num = int(exp_sec * exp_den)
@@ -279,6 +243,8 @@ def process_file(file_path):
                         if fmt == 'srational':
                             if isinstance(val, tuple):
                                 tag_data_block += struct.pack('<' + str(count*2) + 'i', *val)
+                            elif isinstance(val, bytes):
+                                tag_data_block += val
                             else:
                                 tag_data_block += val
                         elif fmt == 'rational':

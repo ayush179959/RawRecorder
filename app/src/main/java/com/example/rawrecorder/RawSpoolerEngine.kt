@@ -26,7 +26,20 @@ class RawSpoolerEngine(
     private val cropTop: Int,
     private val cropWidth: Int,
     private val cropHeight: Int,
-    private val sensorType: Int
+    private val sensorType: Int,
+    private val cal1: IntArray,
+    private val cal2: IntArray,
+    private val baselineExpNum: Int,
+    private val baselineExpDen: Int,
+    private val noiseProfile: FloatArray,
+    private val lensIntrinsic: FloatArray,
+    private val lensDistortion: FloatArray,
+    private val lensAperture: Float,
+    private val lensFocalLength: Float,
+    private val deviceMake: String,
+    private val deviceModel: String,
+    private val preWidth: Int,
+    private val preHeight: Int
 ) {
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
@@ -69,7 +82,7 @@ class RawSpoolerEngine(
         expectedFrameDurationNs = 1_000_000_000L / fps.toLong()
         fileChannel = FileOutputStream(file, false).channel
         
-        val globalHeaderBuffer = ByteBuffer.allocateDirect(512)
+        val globalHeaderBuffer = ByteBuffer.allocateDirect(1024)
         globalHeaderBuffer.order(ByteOrder.LITTLE_ENDIAN)
         globalHeaderBuffer.put("AYUSHRAW".toByteArray())
         globalHeaderBuffer.putInt(width)
@@ -84,27 +97,58 @@ class RawSpoolerEngine(
         for (i in 0 until 18) globalHeaderBuffer.putInt(fm1[i])
         for (i in 0 until 18) globalHeaderBuffer.putInt(fm2[i])
         
+        for (i in 0 until 18) globalHeaderBuffer.putInt(cal1[i])
+        for (i in 0 until 18) globalHeaderBuffer.putInt(cal2[i])
+        
         for (i in 0 until 4) globalHeaderBuffer.putInt(blackLevelPattern[i])
         globalHeaderBuffer.putInt(whiteLevel)
         globalHeaderBuffer.putInt(cropLeft)
         globalHeaderBuffer.putInt(cropTop)
         globalHeaderBuffer.putInt(cropWidth)
         globalHeaderBuffer.putInt(cropHeight)
-        
-        // Write sourceHeight at 360 and dngOrientation at 364
-        globalHeaderBuffer.position(360)
         globalHeaderBuffer.putInt(sourceHeight)
         globalHeaderBuffer.putInt(dngOrientation)
-        
-        // Write useGoogleMetadata mode at 368 (1 = Google metadata, 2 = RawRecorder metadata)
-        globalHeaderBuffer.position(368)
-        globalHeaderBuffer.putInt(if (useGoogleMetadata) 1 else 2)
-        
-        // Write sensorType at 372 (0=main, 1=ultra, 2=tele, 3=front)
         globalHeaderBuffer.putInt(sensorType)
         
-        globalHeaderBuffer.position(0)
+        // Write baselineExposure
+        globalHeaderBuffer.putInt(baselineExpNum)
+        globalHeaderBuffer.putInt(baselineExpDen)
         
+        // Write noiseProfile (8 floats = 32 bytes)
+        for (i in 0 until 8) globalHeaderBuffer.putFloat(noiseProfile[i])
+        
+        // Write lensIntrinsic (5 floats = 20 bytes)
+        for (i in 0 until 5) globalHeaderBuffer.putFloat(lensIntrinsic[i])
+        
+        // Write lensDistortion (5 floats = 20 bytes)
+        for (i in 0 until 5) globalHeaderBuffer.putFloat(lensDistortion[i])
+        
+        // Write lensAperture and lensFocalLength (4 bytes each)
+        globalHeaderBuffer.putFloat(lensAperture)
+        globalHeaderBuffer.putFloat(lensFocalLength)
+        
+        // Write deviceMake (32 bytes ASCII)
+        val makeBytes = ByteArray(32)
+        val makeSrc = deviceMake.toByteArray(Charsets.US_ASCII)
+        System.arraycopy(makeSrc, 0, makeBytes, 0, Math.min(makeSrc.size, 32))
+        globalHeaderBuffer.put(makeBytes)
+        
+        // Write deviceModel (32 bytes ASCII)
+        val modelBytes = ByteArray(32)
+        val modelSrc = deviceModel.toByteArray(Charsets.US_ASCII)
+        System.arraycopy(modelSrc, 0, modelBytes, 0, Math.min(modelSrc.size, 32))
+        globalHeaderBuffer.put(modelBytes)
+        
+        // Write preWidth and preHeight (4 bytes each)
+        globalHeaderBuffer.putInt(preWidth)
+        globalHeaderBuffer.putInt(preHeight)
+        
+        // Pad the rest of the 1024-byte header
+        while (globalHeaderBuffer.hasRemaining()) {
+            globalHeaderBuffer.put(0.toByte())
+        }
+        
+        globalHeaderBuffer.position(0)
         fileChannel?.write(globalHeaderBuffer)
         isRecording = true
     }
@@ -159,7 +203,7 @@ class RawSpoolerEngine(
             strideBuffer.position(0)
             fileChannel?.position(16)
             fileChannel?.write(strideBuffer)
-            fileChannel?.position(512)
+            fileChannel?.position(1024)
         }
         
         val frameHeader = ByteBuffer.allocateDirect(48)
