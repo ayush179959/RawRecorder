@@ -227,46 +227,65 @@ fun GalleryScreen(context: Context) {
                                 )
                             }
                         } else {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                if (item.rawFile != null) {
-                                    // Extract button
+                            Column(horizontalAlignment = Alignment.End) {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    if (item.rawFile != null) {
+                                        // Extract DNG button
+                                        Button(
+                                            onClick = {
+                                                VideoRendererService.startDngExtraction(context, item.rawFile.absolutePath)
+                                            },
+                                            shape = androidx.compose.ui.graphics.RectangleShape,
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            modifier = Modifier.height(32.dp)
+                                        ) {
+                                            Text("DNG", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                        }
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        // Export HEVC button
+                                        Button(
+                                            onClick = {
+                                                VideoRendererService.startHevcExport(context, item.rawFile.absolutePath)
+                                            },
+                                            shape = androidx.compose.ui.graphics.RectangleShape,
+                                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50), contentColor = Color.White),
+                                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                            modifier = Modifier.height(32.dp)
+                                        ) {
+                                            Text("HEVC", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                        }
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                    } else {
+                                        Text(
+                                            text = "EXTRACTED",
+                                            color = Color.Gray,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            modifier = Modifier.padding(horizontal = 8.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                    }
+                                    
+                                    // Delete button
                                     Button(
                                         onClick = {
-                                            VideoRendererService.startDngExtraction(context, item.rawFile.absolutePath)
+                                            item.rawFile?.let { if (it.exists()) it.delete() }
+                                            item.dngDir?.let { dir ->
+                                                if (dir.exists()) {
+                                                    dir.deleteRecursively()
+                                                }
+                                            }
+                                            Toast.makeText(context, "Deleted ${item.displayName}", Toast.LENGTH_SHORT).show()
+                                            refreshItems()
                                         },
                                         shape = androidx.compose.ui.graphics.RectangleShape,
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)
+                                        colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray, contentColor = Color.White),
+                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                        modifier = Modifier.height(32.dp)
                                     ) {
-                                        Text("EXTRACT DNG", fontWeight = FontWeight.Bold, fontSize = 12.sp)
+                                        Text("DELETE", fontWeight = FontWeight.Bold, fontSize = 11.sp)
                                     }
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                } else {
-                                    Text(
-                                        text = "EXTRACTED",
-                                        color = Color.Gray,
-                                        fontSize = 12.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        modifier = Modifier.padding(horizontal = 8.dp)
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                }
-                                
-                                // Delete button
-                                Button(
-                                    onClick = {
-                                        item.rawFile?.let { if (it.exists()) it.delete() }
-                                        item.dngDir?.let { dir ->
-                                            if (dir.exists()) {
-                                                dir.deleteRecursively()
-                                            }
-                                        }
-                                        Toast.makeText(context, "Deleted ${item.displayName}", Toast.LENGTH_SHORT).show()
-                                        refreshItems()
-                                    },
-                                    shape = androidx.compose.ui.graphics.RectangleShape,
-                                    colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray, contentColor = Color.White)
-                                ) {
-                                    Text("DELETE", fontWeight = FontWeight.Bold, fontSize = 12.sp)
                                 }
                             }
                         }
