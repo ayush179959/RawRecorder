@@ -170,6 +170,11 @@ class MainActivity : ComponentActivity() {
     private var showHudMonitor by mutableStateOf(false)
     private var hudFeedbackJob: Job? = null
 
+    private var liveShutter by mutableStateOf(41666666L)
+    private var liveIso by mutableStateOf(400)
+    private var liveFocus by mutableStateOf(0f)
+    private var liveKelvin by mutableStateOf(5500f)
+
     private val requestPermissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
             hasCameraPermission = permissions[Manifest.permission.CAMERA] ?: false
@@ -774,6 +779,10 @@ class MainActivity : ComponentActivity() {
             
             builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(selectedFps, selectedFps))
             
+            // Reset AE/AF triggers in repeating request to prevent continuous jumps and searching
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_IDLE)
+            builder.set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER, CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_IDLE)
+            
             if (is3ALocked) {
                 builder.set(CaptureRequest.CONTROL_AE_LOCK, true)
                 builder.set(CaptureRequest.CONTROL_AWB_LOCK, true)
@@ -963,14 +972,34 @@ class MainActivity : ComponentActivity() {
             rawSpoolerEngine?.updateLiveCaptureParameters(expTime, iso, fd)
             
             val boost = result.get(CaptureResult.CONTROL_POST_RAW_SENSITIVITY_BOOST)
-            if (boost != null) lastPostRawBoost = boost
+            if (boost != null) {
+                lastPostRawBoost = boost
+                rawSpoolerEngine?.livePostRawBoost = boost
+            }
             val aperture = result.get(CaptureResult.LENS_APERTURE)
             if (aperture != null) lastAperture = aperture
             val focalLength = result.get(CaptureResult.LENS_FOCAL_LENGTH)
             if (focalLength != null) lastFocalLength = focalLength
             val noise = result.get(CaptureResult.SENSOR_NOISE_PROFILE)
             if (noise != null) lastNoiseProfile = noise
+
+            // Post updates to UI thread
+            runOnUiThread {
+                liveShutter = expTime
+                liveIso = iso
+                liveFocus = fd
+                if (gains != null) {
+                    liveKelvin = rggbToKelvin(gains.red, gains.blue)
+                }
+            }
         }
+    }
+
+    private fun rggbToKelvin(r: Float, b: Float): Float {
+        val tRed = ((r - 1.0f) / 2.0f).coerceIn(0f, 1f)
+        val tBlue = ((3.5f - b) / 2.5f).coerceIn(0f, 1f)
+        val t = (tRed + tBlue) / 2.0f
+        return 2000f + t * 8000f
     }
 
     private fun handleTouchToFocus(x: Float, y: Float, viewWidthPx: Float, viewHeightPx: Float) {
@@ -1350,17 +1379,22 @@ class MainActivity : ComponentActivity() {
                                 "Main" -> "W"
                                 else -> selectedLens?.name ?: "W"
                             }
-                            val shutterStr = if (isAutoExposure) "AUTO" else formatShutterSpeed(shutterSpeedNanos)
-                            val isoStr = if (isAutoExposure) "AUTO" else "$isoValue"
+                            val shutterStr = if (isAutoExposure) formatShutterSpeed(liveShutter) + " (A)" else formatShutterSpeed(shutterSpeedNanos)
+                            val isoStr = if (isAutoExposure) "$liveIso (A)" else "$isoValue"
                             val focusStr = if (isAutoFocus) {
-                                "AUTO"
+                                if (liveFocus == 0f) {
+                                    "∞ (A)"
+                                } else {
+                                    val m = 1f / liveFocus
+                                    if (m >= 1f) String.format("%.1fm (A)", m) else String.format("%dcm (A)", (m * 100).toInt())
+                                }
                             } else if (focusDistance == 0f) {
                                 "∞"
                             } else {
                                 val m = 1f / focusDistance
                                 if (m >= 1f) String.format("%.1fm", m) else String.format("%dcm", (m * 100).toInt())
                             }
-                            val tempStr = if (isAutoWb) "AUTO" else "${kelvinValue.toInt()}K"
+                            val tempStr = if (isAutoWb) "${liveKelvin.toInt()}K (A)" else "${kelvinValue.toInt()}K"
 
                             ParameterCard("LENS", lensStr, activeDragMenu == "LENSES", 
                                 onClick = { activeDragMenu = if (activeDragMenu == "LENSES") "" else "LENSES" },
@@ -1580,17 +1614,22 @@ class MainActivity : ComponentActivity() {
                             "Main" -> "W"
                             else -> selectedLens?.name ?: "W"
                         }
-                        val shutterStr = if (isAutoExposure) "AUTO" else formatShutterSpeed(shutterSpeedNanos)
-                        val isoStr = if (isAutoExposure) "AUTO" else "$isoValue"
+                        val shutterStr = if (isAutoExposure) formatShutterSpeed(liveShutter) + " (A)" else formatShutterSpeed(shutterSpeedNanos)
+                        val isoStr = if (isAutoExposure) "$liveIso (A)" else "$isoValue"
                         val focusStr = if (isAutoFocus) {
-                            "AUTO"
+                            if (liveFocus == 0f) {
+                                "∞ (A)"
+                            } else {
+                                val m = 1f / liveFocus
+                                if (m >= 1f) String.format("%.1fm (A)", m) else String.format("%dcm (A)", (m * 100).toInt())
+                            }
                         } else if (focusDistance == 0f) {
                             "∞"
                         } else {
                             val m = 1f / focusDistance
                             if (m >= 1f) String.format("%.1fm", m) else String.format("%dcm", (m * 100).toInt())
                         }
-                        val tempStr = if (isAutoWb) "AUTO" else "${kelvinValue.toInt()}K"
+                        val tempStr = if (isAutoWb) "${liveKelvin.toInt()}K (A)" else "${kelvinValue.toInt()}K"
 
                         ParameterCard("LENS", lensStr, activeDragMenu == "LENSES", 
                             onClick = { activeDragMenu = if (activeDragMenu == "LENSES") "" else "LENSES" },
@@ -1760,7 +1799,7 @@ class MainActivity : ComponentActivity() {
 
                         // 2. Presets Row
                         val shutterPresets = listOf(
-                            125000L to "1/8000", 250000L to "1/4000", 500000L to "1/2000", 
+                            125000L to "1/8000", 250000L to "1/4000", 500000L to "1/2000",  
                             1000000L to "1/1000", 2000000L to "1/500", 4000000L to "1/250", 
                             8000000L to "1/125", 16666666L to "1/60", 33333333L to "1/30", 
                             66666666L to "1/15", 125000000L to "1/8", 250000000L to "1/4", 
@@ -2159,24 +2198,27 @@ class MainActivity : ComponentActivity() {
                             val prefix = "${captureName}_"
                             var maxIndex = 0
                             val scanDirs = mutableListOf<File>()
-                            getExternalFilesDir(null)?.let { scanDirs.add(it) }
-                            Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)?.let { scanDirs.add(it) }
+                            getExternalFilesDir(null)?.let { 
+                                scanDirs.add(it) 
+                                scanDirs.add(File(it, "RawRecorder"))
+                            }
+                            val docDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                            if (docDir != null) {
+                                scanDirs.add(docDir)
+                                scanDirs.add(File(docDir, "RawRecorder"))
+                            }
                             for (sDir in scanDirs) {
                                 if (!sDir.exists()) continue
-                                val rawFiles = sDir.listFiles { _, name -> name.startsWith(prefix) && name.endsWith(".ayushraw") }
-                                rawFiles?.forEach { f ->
-                                    val numStr = f.name.removePrefix(prefix).removeSuffix(".ayushraw")
-                                    val num = numStr.toIntOrNull()
-                                    if (num != null && num > maxIndex) {
-                                        maxIndex = num
-                                    }
-                                }
-                                val rawRecorderDir = File(sDir, "RawRecorder")
-                                if (rawRecorderDir.exists()) {
-                                    val subDirs = rawRecorderDir.listFiles { f -> f.isDirectory && f.name.startsWith(prefix) }
-                                    subDirs?.forEach { d ->
-                                        val numStr = d.name.removePrefix(prefix)
-                                        val num = numStr.toIntOrNull()
+                                val files = sDir.listFiles() ?: continue
+                                for (f in files) {
+                                    val name = f.name
+                                    if (name.startsWith(prefix)) {
+                                        var rest = name.substring(prefix.length)
+                                        val dotIdx = rest.indexOf('.')
+                                        if (dotIdx >= 0) {
+                                            rest = rest.substring(0, dotIdx)
+                                        }
+                                        val num = rest.toIntOrNull()
                                         if (num != null && num > maxIndex) {
                                             maxIndex = num
                                         }
@@ -2216,10 +2258,15 @@ class MainActivity : ComponentActivity() {
     @Composable
     private fun HudMonitor(modifier: Modifier = Modifier) {
         val formatStr = "RAW10"
-        val shutterStr = if (isAutoExposure) "Auto EXP" else "1/${1000000000L / max(1, shutterSpeedNanos)}s"
-        val isoStr = if (isAutoExposure) "Auto ISO" else "ISO $isoValue"
-        val tempStr = if (isAutoWb) "Auto WB" else "${kelvinValue.toInt()}K"
-        val focusStr = if (isAutoFocus) "AF-C" else "MF ${String.format("%.2f", focusDistance)}m"
+        val shutterStr = if (isAutoExposure) formatShutterSpeed(liveShutter) + " (A)" else "1/${1000000000L / max(1, shutterSpeedNanos)}s"
+        val isoStr = if (isAutoExposure) "ISO $liveIso (A)" else "ISO $isoValue"
+        val tempStr = if (isAutoWb) "${liveKelvin.toInt()}K (A)" else "${kelvinValue.toInt()}K"
+        val focusStr = if (isAutoFocus) {
+            val dist = if (liveFocus == 0f) "∞" else String.format("%.2f", 1f / liveFocus)
+            "AF-C $dist" + "m (A)"
+        } else {
+            "MF ${String.format("%.2f", focusDistance)}m"
+        }
         val stabStr = if (stabilityMode == StabilityMode.OFF) "" else " • ${stabilityMode.name}"
 
         Box(

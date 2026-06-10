@@ -64,6 +64,7 @@ class RawSpoolerEngine(
     private var liveShutter = 0L
     private var liveIso = 0
     private var liveFocus = 0f
+    @Volatile var livePostRawBoost = 100
     
     fun prepareEnginePipeline() {
         handlerThread = HandlerThread("RawSpoolerThread").apply { start() }
@@ -217,6 +218,7 @@ class RawSpoolerEngine(
         frameHeader.putFloat(liveAwbG_even)
         frameHeader.putFloat(liveAwbG_odd)
         frameHeader.putFloat(liveAwbB)
+        frameHeader.putInt(livePostRawBoost)
         frameHeader.position(0)
         
         fileChannel?.write(frameHeader)

@@ -44,6 +44,7 @@ data class GalleryItem(
     val displayName: String,
     val rawFile: File?,
     val dngDir: File?,
+    val hevcFile: File?,
     val previewFile: File?,
     val sizeString: String,
     val isExtracted: Boolean
@@ -52,6 +53,7 @@ data class GalleryItem(
 class GalleryItemBuilder(val id: String) {
     var rawFile: File? = null
     var dngDir: File? = null
+    var hevcFile: File? = null
     var previewFile: File? = null
 }
 
@@ -73,7 +75,7 @@ fun loadGalleryItems(context: Context): List<GalleryItem> {
         }
     }
     
-    // 2. Scan Documents/RawRecorder for extracted folders
+    // 2. Scan Documents/RawRecorder for extracted folders and HEVC videos
     val docDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
     val rawRecorderDir = File(docDir, "RawRecorder")
     val rawRecorderDirs = mutableListOf(rawRecorderDir)
@@ -83,6 +85,8 @@ fun loadGalleryItems(context: Context): List<GalleryItem> {
     
     for (rDir in rawRecorderDirs) {
         if (!rDir.exists()) continue
+        
+        // Scan folders (DNG extracted frames)
         val subDirs = rDir.listFiles { f -> f.isDirectory } ?: continue
         for (subDir in subDirs) {
             val id = subDir.name
@@ -93,6 +97,14 @@ fun loadGalleryItems(context: Context): List<GalleryItem> {
                 builder.previewFile = preview
             }
         }
+        
+        // Scan files (HEVC rendered videos)
+        val mp4Files = rDir.listFiles { f -> f.isFile && f.name.endsWith(".mp4") } ?: continue
+        for (mp4File in mp4Files) {
+            val id = mp4File.nameWithoutExtension
+            val builder = itemsMap.getOrPut(id) { GalleryItemBuilder(id) }
+            builder.hevcFile = mp4File
+        }
     }
     
     // 3. Convert to GalleryItem list
@@ -100,14 +112,17 @@ fun loadGalleryItems(context: Context): List<GalleryItem> {
         val id = builder.id
         val rawFile = builder.rawFile
         val dngDir = builder.dngDir
+        val hevcFile = builder.hevcFile
         val previewFile = builder.previewFile
         
-        val isExtracted = dngDir != null
+        val isExtracted = dngDir != null || hevcFile != null
         val sizeString = if (rawFile != null) {
             "${rawFile.length() / (1024 * 1024)} MB"
         } else if (dngDir != null) {
             val dngCount = dngDir.listFiles { _, name -> name.endsWith(".dng") }?.size ?: 0
             "$dngCount frames"
+        } else if (hevcFile != null) {
+            "${hevcFile.length() / (1024 * 1024)} MB (Video)"
         } else {
             ""
         }
@@ -117,6 +132,7 @@ fun loadGalleryItems(context: Context): List<GalleryItem> {
             displayName = id,
             rawFile = rawFile,
             dngDir = dngDir,
+            hevcFile = hevcFile,
             previewFile = previewFile,
             sizeString = sizeString,
             isExtracted = isExtracted
@@ -184,12 +200,12 @@ fun GalleryScreen(context: Context) {
                                     modifier = Modifier.fillMaxSize()
                                 )
                             } else {
-                                Text(
-                                    text = if (item.isExtracted) "DNG" else "RAW",
-                                    color = Color.DarkGray,
-                                    fontSize = 12.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
+                                 Text(
+                                     text = if (item.hevcFile != null) "HEVC" else if (item.dngDir != null) "DNG" else "RAW",
+                                     color = Color.DarkGray,
+                                     fontSize = 12.sp,
+                                     fontWeight = FontWeight.Bold
+                                 )
                             }
                         }
 
@@ -257,35 +273,36 @@ fun GalleryScreen(context: Context) {
                                         }
                                         Spacer(modifier = Modifier.width(6.dp))
                                     } else {
-                                        Text(
-                                            text = "EXTRACTED",
-                                            color = Color.Gray,
-                                            fontSize = 11.sp,
-                                            fontWeight = FontWeight.Bold,
-                                            modifier = Modifier.padding(horizontal = 8.dp)
-                                        )
-                                        Spacer(modifier = Modifier.width(6.dp))
+                                         Text(
+                                             text = if (item.dngDir != null) "DNG EXTRACTED" else "HEVC EXPORTED",
+                                             color = Color.Gray,
+                                             fontSize = 11.sp,
+                                             fontWeight = FontWeight.Bold,
+                                             modifier = Modifier.padding(horizontal = 8.dp)
+                                         )
+                                         Spacer(modifier = Modifier.width(6.dp))
                                     }
                                     
                                     // Delete button
-                                    Button(
-                                        onClick = {
-                                            item.rawFile?.let { if (it.exists()) it.delete() }
-                                            item.dngDir?.let { dir ->
-                                                if (dir.exists()) {
-                                                    dir.deleteRecursively()
-                                                }
-                                            }
-                                            Toast.makeText(context, "Deleted ${item.displayName}", Toast.LENGTH_SHORT).show()
-                                            refreshItems()
-                                        },
-                                        shape = androidx.compose.ui.graphics.RectangleShape,
-                                        colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray, contentColor = Color.White),
-                                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
-                                        modifier = Modifier.height(32.dp)
-                                    ) {
-                                        Text("DELETE", fontWeight = FontWeight.Bold, fontSize = 11.sp)
-                                    }
+                                     Button(
+                                         onClick = {
+                                             item.rawFile?.let { if (it.exists()) it.delete() }
+                                             item.hevcFile?.let { if (it.exists()) it.delete() }
+                                             item.dngDir?.let { dir ->
+                                                 if (dir.exists()) {
+                                                     dir.deleteRecursively()
+                                                 }
+                                             }
+                                             Toast.makeText(context, "Deleted ${item.displayName}", Toast.LENGTH_SHORT).show()
+                                             refreshItems()
+                                         },
+                                         shape = androidx.compose.ui.graphics.RectangleShape,
+                                         colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray, contentColor = Color.White),
+                                         contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                         modifier = Modifier.height(32.dp)
+                                     ) {
+                                         Text("DELETE", fontWeight = FontWeight.Bold, fontSize = 11.sp)
+                                     }
                                 }
                             }
                         }

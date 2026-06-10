@@ -33,6 +33,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.max
+import kotlin.math.abs
 
 object VideoRendererService {
     private const val TAG = "VideoRendererService"
@@ -42,6 +43,193 @@ object VideoRendererService {
     var renderingPath by mutableStateOf("")
     var currentPhase by mutableStateOf("")
     var progressFraction by mutableStateOf(0f)
+
+    // --- 3x3 matrix helpers (row-major) ---
+    private fun mat3Det(m: FloatArray): Float {
+        return m[0]*(m[4]*m[8] - m[5]*m[7]) -
+               m[1]*(m[3]*m[8] - m[5]*m[6]) +
+               m[2]*(m[3]*m[7] - m[4]*m[6])
+    }
+
+    private fun mat3Inv(m: FloatArray): FloatArray? {
+        val det = mat3Det(m)
+        if (abs(det) < 1e-10f) return null
+        val invDet = 1.0f / det
+        return floatArrayOf(
+            (m[4]*m[8] - m[5]*m[7]) * invDet,
+            (m[2]*m[7] - m[1]*m[8]) * invDet,
+            (m[1]*m[5] - m[2]*m[4]) * invDet,
+            (m[5]*m[6] - m[3]*m[8]) * invDet,
+            (m[0]*m[8] - m[2]*m[6]) * invDet,
+            (m[2]*m[3] - m[0]*m[5]) * invDet,
+            (m[3]*m[7] - m[4]*m[6]) * invDet,
+            (m[1]*m[6] - m[0]*m[7]) * invDet,
+            (m[0]*m[4] - m[1]*m[3]) * invDet
+        )
+    }
+
+    /** C = A × B (both row-major 3×3) */
+    private fun mat3Mul(a: FloatArray, b: FloatArray): FloatArray {
+        val c = FloatArray(9)
+        for (r in 0..2) for (col in 0..2) {
+            c[r*3+col] = a[r*3]*b[col] + a[r*3+1]*b[3+col] + a[r*3+2]*b[6+col]
+        }
+        return c
+    }
+
+    /** result = M × v  (3×3 × 3×1) */
+    private fun mat3MulVec(m: FloatArray, v: FloatArray): FloatArray {
+        return floatArrayOf(
+            m[0]*v[0] + m[1]*v[1] + m[2]*v[2],
+            m[3]*v[0] + m[4]*v[1] + m[5]*v[2],
+            m[6]*v[0] + m[7]*v[1] + m[8]*v[2]
+        )
+    }
+
+    /** Build diag(v) 3×3 */
+    private fun mat3Diag(v: FloatArray): FloatArray {
+        return floatArrayOf(
+            v[0], 0f, 0f,
+            0f, v[1], 0f,
+            0f, 0f, v[2]
+        )
+    }
+
+    /** Parse a RATIONAL or SRATIONAL array (pairs of int) into a 3×3 float matrix. */
+    private fun parseRationalMatrix(raw: IntArray): FloatArray {
+        val m = FloatArray(9)
+        for (i in 0 until 9) {
+            val num = raw[i * 2].toFloat()
+            val den = raw[i * 2 + 1].toFloat()
+            m[i] = if (den != 0f) num / den else 0f
+        }
+        return m
+    }
+
+    private fun isMatrixValid(m: FloatArray): Boolean {
+        var allZeros = true
+        for (v in m) if (v != 0f) { allZeros = false; break }
+        if (allZeros) return false
+        // Check for identity-like (all diagonal 1, rest 0) – means "not set"
+        var isIdentity = true
+        for (i in 0 until 9) {
+            val expected = if (i == 0 || i == 4 || i == 8) 1f else 0f
+            if (m[i] != expected) { isIdentity = false; break }
+        }
+        // Identity IS valid – it just means no transform, which is fine
+        return true
+    }
+
+    /**
+     * Build the combined camera-to-sRGB matrix using ColorMatrix-inverse approach,
+     * with interpolation between calibration illuminant 1 (StdA) and illuminant 2 (D65)
+     * based on the scene white balance.
+     *
+     *   outputRGB = sRGBfromXYZ × CM_interp⁻¹ × diag(chicken) × CC⁻¹ × white-balanced-camera-values
+     *
+     * The ColorMatrix-inverse approach (used by dcraw / Adobe) produces ~1.8x more
+     * saturated colors than the ForwardMatrix approach in the DNG spec.
+     *
+     * Interpolation weight derived from AWB gains:
+     *   Warm scene (rVal > 1, bVal < 1) → blend toward illuminant 1 (StdA)
+     *   Neutral/cool scene             → blend toward illuminant 2 (D65)
+     */
+    private fun buildCombinedColorMatrix(
+        fm1Raw: IntArray, cm1Raw: IntArray, cal1Raw: IntArray,
+        fm2Raw: IntArray, cm2Raw: IntArray, cal2Raw: IntArray,
+        rVal: Float, bVal: Float
+    ): FloatArray {
+        val d50White = floatArrayOf(0.9642f, 1.0000f, 0.8249f)
+
+        val sRGBfromXYZ = floatArrayOf(
+             3.1338561f, -1.6168667f, -0.4906146f,
+            -0.9787684f,  1.9161415f,  0.0334540f,
+             0.0719453f, -0.2289914f,  1.4052427f
+        )
+
+        val camToXYZ1 = computeCameraToXYZ(fm1Raw, cm1Raw, cal1Raw, d50White)
+        val camToXYZ2 = computeCameraToXYZ(fm2Raw, cm2Raw, cal2Raw, d50White)
+
+        val warmScore = max(0f, rVal - 1f) + max(0f, 1f - bVal)
+        val blend = 1f / (1f + warmScore * 0.75f)
+
+        val camToXYZ = FloatArray(9)
+        for (i in 0 until 9) {
+            camToXYZ[i] = camToXYZ1[i] * (1f - blend) + camToXYZ2[i] * blend
+        }
+
+        val combined = mat3Mul(sRGBfromXYZ, camToXYZ)
+
+        Log.d(TAG, "Combined color matrix (blend=${java.lang.String.format("%.3f", blend)}): [${combined.joinToString()}]")
+        return combined
+    }
+
+    /**
+     * Compute camera-RGB → XYZ-D50 using ColorMatrix-inverse approach (dcraw-style).
+     *
+     *   camToXYZ = CM⁻¹ × diag(CM × D50_XYZ)
+     *
+     * The "chicken" normalization (CM × D50_XYZ) ensures [1,1,1] maps to D50_XYZ,
+     * preserving neutral white. This produces much more saturated colors than the
+     * ForwardMatrix approach (~1.8x more for typical camera primaries).
+     *
+     * Falls back to ForwardMatrix approach if ColorMatrix is unavailable.
+     */
+    private fun computeCameraToXYZ(
+        fmRaw: IntArray, cmRaw: IntArray, calRaw: IntArray, d50White: FloatArray
+    ): FloatArray {
+        val identity = floatArrayOf(1f, 0f, 0f, 0f, 1f, 0f, 0f, 0f, 1f)
+        val CM = parseRationalMatrix(cmRaw)
+        val FM = parseRationalMatrix(fmRaw)
+        val CC = parseRationalMatrix(calRaw)
+
+        var ccValid = CC.any { it != 0f }
+        if (ccValid) {
+            var isId = true
+            for (i in 0 until 9) {
+                val expected = if (i == 0 || i == 4 || i == 8) 1f else 0f
+                if (abs(CC[i] - expected) > 1e-6f) { isId = false; break }
+            }
+            if (isId) ccValid = false
+        }
+
+        val camToXYZ: FloatArray
+        if (CM.any { it != 0f }) {
+            val cmInv = mat3Inv(CM)
+            if (cmInv != null) {
+                // chicken = CM × D50_XYZ: camera RGB for D50 white
+                val chicken = mat3MulVec(CM, d50White)
+                // camToXYZ = CM⁻¹ × diag(chicken)  → maps [1,1,1] to D50_XYZ
+                camToXYZ = mat3Mul(cmInv, mat3Diag(chicken))
+            } else {
+                // CM is singular, fall back to ForwardMatrix
+                val fmInv = mat3Inv(FM)
+                if (fmInv != null) {
+                    val d = mat3MulVec(fmInv, d50White)
+                    camToXYZ = mat3Mul(FM, mat3Diag(d))
+                } else {
+                    camToXYZ = identity.copyOf()
+                }
+            }
+        } else if (FM.any { it != 0f }) {
+            val fmInv = mat3Inv(FM)
+            if (fmInv != null) {
+                val d = mat3MulVec(fmInv, d50White)
+                camToXYZ = mat3Mul(FM, mat3Diag(d))
+            } else {
+                camToXYZ = FM.copyOf()
+            }
+        } else {
+            camToXYZ = identity.copyOf()
+        }
+
+        if (ccValid) {
+            val ccInv = mat3Inv(CC)
+            if (ccInv != null)
+                return mat3Mul(camToXYZ, ccInv)
+        }
+        return camToXYZ
+    }
 
     private fun readFully(fis: FileInputStream, array: ByteArray): Boolean {
         var bytesRead = 0
@@ -224,6 +412,8 @@ object VideoRendererService {
             val sourceHeightVal = buffer.int
             val dngOrientationVal = buffer.int
             val sensorType = buffer.int
+            val baselineExpNum = buffer.int
+            val baselineExpDen = buffer.int
 
             val sourceHeight = if (sourceHeightVal in 1..10000) sourceHeightVal else height
             val payloadSize = sourceHeight * rowStride
@@ -282,60 +472,9 @@ object VideoRendererService {
                 else -> intArrayOf(1, 2, 0, 1)
             }
 
-            var isFmValid = false
-            for (x in fm1) {
-                if (x != 0) {
-                    isFmValid = true
-                    break
-                }
-            }
-
-            val FM = if (isFmValid) {
-                val m = FloatArray(9)
-                for (i in 0 until 9) {
-                    val num = fm1[i * 2].toFloat()
-                    val den = fm1[i * 2 + 1].toFloat()
-                    m[i] = if (den != 0f) num / den else 0f
-                }
-                m
-            } else {
-                floatArrayOf(
-                    1f, 0f, 0f,
-                    0f, 1f, 0f,
-                    0f, 0f, 1f
-                )
-            }
-
-            var allOnes = true
-            var allZeros = true
-            for (i in 0 until 9) {
-                if (FM[i] != 1f) allOnes = false
-                if (FM[i] != 0f) allZeros = false
-            }
-            if (allOnes || allZeros) {
-                for (i in 0 until 9) {
-                    FM[i] = if (i % 4 == 0) 1f else 0f
-                }
-            }
-
-            val mXYZToTarget = floatArrayOf(
-                 3.1338561f, -1.6168667f, -0.4906146f,
-                -0.9787684f,  1.9161415f,  0.0334540f,
-                 0.0719453f, -0.2289914f,  1.4052427f
-            )
-
-            val combinedMatrix = FloatArray(9)
-            combinedMatrix[0] = mXYZToTarget[0]*FM[0] + mXYZToTarget[1]*FM[3] + mXYZToTarget[2]*FM[6]
-            combinedMatrix[1] = mXYZToTarget[0]*FM[1] + mXYZToTarget[1]*FM[4] + mXYZToTarget[2]*FM[7]
-            combinedMatrix[2] = mXYZToTarget[0]*FM[2] + mXYZToTarget[1]*FM[5] + mXYZToTarget[2]*FM[8]
-
-            combinedMatrix[3] = mXYZToTarget[3]*FM[0] + mXYZToTarget[4]*FM[3] + mXYZToTarget[5]*FM[6]
-            combinedMatrix[4] = mXYZToTarget[3]*FM[1] + mXYZToTarget[4]*FM[4] + mXYZToTarget[5]*FM[7]
-            combinedMatrix[5] = mXYZToTarget[3]*FM[2] + mXYZToTarget[4]*FM[5] + mXYZToTarget[5]*FM[8]
-
-            combinedMatrix[6] = mXYZToTarget[6]*FM[0] + mXYZToTarget[7]*FM[3] + mXYZToTarget[8]*FM[6]
-            combinedMatrix[7] = mXYZToTarget[6]*FM[1] + mXYZToTarget[7]*FM[4] + mXYZToTarget[8]*FM[7]
-            combinedMatrix[8] = mXYZToTarget[6]*FM[2] + mXYZToTarget[7]*FM[5] + mXYZToTarget[8]*FM[8]
+            // Build combined color matrix using DNG spec pipeline with illuminant interpolation
+            // Defer to first frame so we have AWB gains for the blend
+            var combinedMatrix = FloatArray(9)
 
             // Setup GL textures and coordinate buffers
             val textures = IntArray(1)
@@ -378,6 +517,7 @@ object VideoRendererService {
             val trackIndexRef = intArrayOf(-1)
             val muxerStartedRef = booleanArrayOf(false)
             var inputEndOfStream = false
+            var matrixComputed = false
 
             while (!inputEndOfStream) {
                 var timestampNs = 0L
@@ -394,6 +534,7 @@ object VideoRendererService {
                     val gGreenEven = frameBuf.float
                     val gGreenOdd = frameBuf.float
                     val gBlue = frameBuf.float
+                    val postRawBoost = frameBuf.int
 
                     val rGain = max(0.0001f, gRed)
                     val gGain = max(0.0001f, (gGreenEven + gGreenOdd) / 2.0f)
@@ -403,6 +544,13 @@ object VideoRendererService {
 
                     if (readFully(fis, payload)) {
                         gotFrame = true
+
+                        if (!matrixComputed) {
+                            combinedMatrix = buildCombinedColorMatrix(
+                                fm1, cm1, cal1, fm2, cm2, cal2, rVal, bVal
+                            )
+                            matrixComputed = true
+                        }
 
                         val cropStartRow = ((sourceHeight - height) / 2) and -2
                         
@@ -418,11 +566,15 @@ object VideoRendererService {
                         )
 
                         // Render frame
+                        val boostMultiplier = postRawBoost.toFloat() / 100f
+                        val exposureGain = boostMultiplier * 1.25f
+
                         renderer.drawFrame(
                             rawTextureId, rowStride.toFloat(), sourceHeight.toFloat(),
                             encWidth, encHeight, cropStartRow,
                             cfaTuple, blackLevelFloats, whiteLevel.toFloat(),
                             rVal, bVal, combinedMatrix,
+                            exposureGain,
                             posBuffer, texBuffer
                         )
 
@@ -597,6 +749,8 @@ object VideoRendererService {
                 val sourceHeightVal = buffer.int
                 val dngOrientationVal = buffer.int
                 val sensorType = buffer.int
+                val baselineExpNum = buffer.int
+                val baselineExpDen = buffer.int
                 
                 val sourceHeight = if (sourceHeightVal in 1..10000) sourceHeightVal else height
                 val payloadSize = sourceHeight * rowStride
@@ -619,6 +773,7 @@ object VideoRendererService {
                 val gGreenEven = frameBuf.float
                 val gGreenOdd = frameBuf.float
                 val gBlue = frameBuf.float
+                val postRawBoost = frameBuf.int
                 
                 val rGain = if (gRed > 0.0001f) gRed else 1.0f
                 val gGain = if ((gGreenEven + gGreenOdd) > 0.0001f) (gGreenEven + gGreenOdd) / 2.0f else 1.0f
@@ -686,65 +841,16 @@ object VideoRendererService {
                     }
                 }
                 
-                var isFmValid = false
-                for (x in fm1) {
-                    if (x != 0) {
-                        isFmValid = true
-                        break
-                    }
-                }
-                
-                val FM = if (isFmValid) {
-                    val m = FloatArray(9)
-                    for (i in 0 until 9) {
-                        val num = fm1[i * 2].toFloat()
-                        val den = fm1[i * 2 + 1].toFloat()
-                        m[i] = if (den != 0f) num / den else 0f
-                    }
-                    m
-                } else {
-                    floatArrayOf(
-                        1f, 0f, 0f,
-                        0f, 1f, 0f,
-                        0f, 0f, 1f
-                    )
-                }
-                
-                var allOnes = true
-                var allZeros = true
-                for (i in 0 until 9) {
-                    if (FM[i] != 1f) allOnes = false
-                    if (FM[i] != 0f) allZeros = false
-                }
-                if (allOnes || allZeros) {
-                    for (i in 0 until 9) {
-                        FM[i] = if (i % 4 == 0) 1f else 0f
-                    }
-                }
-                
-                val mXYZToTarget = floatArrayOf(
-                     3.1338561f, -1.6168667f, -0.4906146f,
-                    -0.9787684f,  1.9161415f,  0.0334540f,
-                     0.0719453f, -0.2289914f,  1.4052427f
-                )
-                
-                val combinedMatrix = FloatArray(9)
-                combinedMatrix[0] = mXYZToTarget[0]*FM[0] + mXYZToTarget[1]*FM[3] + mXYZToTarget[2]*FM[6]
-                combinedMatrix[1] = mXYZToTarget[0]*FM[1] + mXYZToTarget[1]*FM[4] + mXYZToTarget[2]*FM[7]
-                combinedMatrix[2] = mXYZToTarget[0]*FM[2] + mXYZToTarget[1]*FM[5] + mXYZToTarget[2]*FM[8]
-                
-                combinedMatrix[3] = mXYZToTarget[3]*FM[0] + mXYZToTarget[4]*FM[3] + mXYZToTarget[5]*FM[6]
-                combinedMatrix[4] = mXYZToTarget[3]*FM[1] + mXYZToTarget[4]*FM[4] + mXYZToTarget[5]*FM[7]
-                combinedMatrix[5] = mXYZToTarget[3]*FM[2] + mXYZToTarget[4]*FM[5] + mXYZToTarget[5]*FM[8]
-                
-                combinedMatrix[6] = mXYZToTarget[6]*FM[0] + mXYZToTarget[7]*FM[3] + mXYZToTarget[8]*FM[6]
-                combinedMatrix[7] = mXYZToTarget[6]*FM[1] + mXYZToTarget[7]*FM[4] + mXYZToTarget[8]*FM[7]
-                combinedMatrix[8] = mXYZToTarget[6]*FM[2] + mXYZToTarget[7]*FM[5] + mXYZToTarget[8]*FM[8]
+                // Build combined color matrix using DNG spec pipeline with illuminant interpolation
+                val combinedMatrix = buildCombinedColorMatrix(fm1, cm1, cal1, fm2, cm2, cal2, rVal, bVal)
 
                 val scale = 4
                 val previewWidth = width / scale
                 val previewHeight = height / scale
                 val colors = IntArray(previewWidth * previewHeight)
+                
+                val boostMultiplier = postRawBoost.toFloat() / 100f
+                val exposureGain = boostMultiplier * 1.25f
                 
                 for (py in 0 until previewHeight) {
                     val y = py * scale
@@ -789,13 +895,26 @@ object VideoRendererService {
                             }
                         }
                         
-                        var rout = combinedMatrix[0]*r + combinedMatrix[1]*g + combinedMatrix[2]*b
-                        var gout = combinedMatrix[3]*r + combinedMatrix[4]*g + combinedMatrix[5]*b
-                        var bout = combinedMatrix[6]*r + combinedMatrix[7]*g + combinedMatrix[8]*b
+                        var rout = (combinedMatrix[0]*r + combinedMatrix[1]*g + combinedMatrix[2]*b) * exposureGain
+                        var gout = (combinedMatrix[3]*r + combinedMatrix[4]*g + combinedMatrix[5]*b) * exposureGain
+                        var bout = (combinedMatrix[6]*r + combinedMatrix[7]*g + combinedMatrix[8]*b) * exposureGain
                         
-                        rout = Math.pow(rout.coerceIn(0f, 1f).toDouble(), 0.45).toFloat()
-                        gout = Math.pow(gout.coerceIn(0f, 1f).toDouble(), 0.45).toFloat()
-                        bout = Math.pow(bout.coerceIn(0f, 1f).toDouble(), 0.45).toFloat()
+                        // Apply ACES filmic tone mapping to match raw editor highlight roll-off
+                        fun aces(x: Float): Float {
+                            val a = 2.51f
+                            val b = 0.03f
+                            val c = 2.43f
+                            val d = 0.59f
+                            val e = 0.14f
+                            return ((x * (a * x + b)) / (x * (c * x + d) + e)).coerceIn(0f, 1f)
+                        }
+                        rout = aces(rout)
+                        gout = aces(gout)
+                        bout = aces(bout)
+
+                        rout = Math.pow(rout.toDouble(), 0.45).toFloat()
+                        gout = Math.pow(gout.toDouble(), 0.45).toFloat()
+                        bout = Math.pow(bout.toDouble(), 0.45).toFloat()
                         
                         val ir = (rout * 255f).toInt().coerceIn(0, 255)
                         val ig = (gout * 255f).toInt().coerceIn(0, 255)
@@ -927,6 +1046,7 @@ class GLRenderer {
     private var uWhiteLevelLoc = -1
     private var uAWBGainsLoc = -1
     private var uColorMatrixLoc = -1
+    private var uExposureGainLoc = -1
 
     private val vertexShaderCode = """
         #version 300 es
@@ -956,6 +1076,7 @@ class GLRenderer {
         uniform float uWhiteLevel;
         uniform vec2 uAWBGains;
         uniform float uColorMatrix[9];
+        uniform float uExposureGain;
 
         float getByte(int bx, int by) {
             vec2 uv = (vec2(float(bx), float(by)) + 0.5) / vec2(uTexWidth, uTexHeight);
@@ -983,6 +1104,17 @@ class GLRenderer {
             }
 
             return b_pixel * 4.0 + float(lsb);
+        }
+
+        // Rec.709 OETF (Optical-Electro Transfer Function)
+        // Maps linear light [0,1] to display signal [0,1]
+        float rec709_oetf(float L) {
+            L = clamp(L, 0.0, 1.0);
+            if (L < 0.018) {
+                return 4.5 * L;
+            } else {
+                return 1.099 * pow(L, 0.45) - 0.099;
+            }
         }
 
         float getNorm(int px, int py, int ch) {
@@ -1045,15 +1177,28 @@ class GLRenderer {
                 }
             }
 
+            // Apply color matrix (camera → sRGB/Rec.709 linear)
             float rout = uColorMatrix[0]*r + uColorMatrix[1]*g + uColorMatrix[2]*b;
             float gout = uColorMatrix[3]*r + uColorMatrix[4]*g + uColorMatrix[5]*b;
             float bout = uColorMatrix[6]*r + uColorMatrix[7]*g + uColorMatrix[8]*b;
 
-            float rLog = clamp(685.0 + 300.0 * log(max(rout, 0.0) * 0.9890396 + 0.0109604) / 2.30258509, 0.0, 1023.0);
-            float gLog = clamp(685.0 + 300.0 * log(max(gout, 0.0) * 0.9890396 + 0.0109604) / 2.30258509, 0.0, 1023.0);
-            float bLog = clamp(685.0 + 300.0 * log(max(bout, 0.0) * 0.9890396 + 0.0109604) / 2.30258509, 0.0, 1023.0);
+            // Apply exposure gain boost
+            rout *= uExposureGain;
+            gout *= uExposureGain;
+            bout *= uExposureGain;
 
-            fragColor = vec4(rLog / 1023.0, gLog / 1023.0, bLog / 1023.0, 1.0);
+            // Apply ACES filmic tone mapping to prevent highlight clipping and wash-out
+            float tmA = 2.51;
+            float tmB = 0.03;
+            float tmC = 2.43;
+            float tmD = 0.59;
+            float tmE = 0.14;
+            rout = clamp((rout * (tmA * rout + tmB)) / (rout * (tmC * rout + tmD) + tmE), 0.0, 1.0);
+            gout = clamp((gout * (tmA * gout + tmB)) / (gout * (tmC * gout + tmD) + tmE), 0.0, 1.0);
+            bout = clamp((bout * (tmA * bout + tmB)) / (bout * (tmC * bout + tmD) + tmE), 0.0, 1.0);
+
+            // Apply Rec.709 OETF (linear → gamma-encoded for display)
+            fragColor = vec4(rec709_oetf(rout), rec709_oetf(gout), rec709_oetf(bout), 1.0);
         }
     """.trimIndent()
 
@@ -1086,6 +1231,7 @@ class GLRenderer {
         uWhiteLevelLoc = GLES20.glGetUniformLocation(program, "uWhiteLevel")
         uAWBGainsLoc = GLES20.glGetUniformLocation(program, "uAWBGains")
         uColorMatrixLoc = GLES20.glGetUniformLocation(program, "uColorMatrix")
+        uExposureGainLoc = GLES20.glGetUniformLocation(program, "uExposureGain")
     }
 
     private fun loadShader(type: Int, shaderCode: String): Int {
@@ -1107,6 +1253,7 @@ class GLRenderer {
         width: Int, height: Int, cropStartRow: Int,
         cfaTuple: IntArray, blackLevel: FloatArray, whiteLevel: Float,
         rVal: Float, bVal: Float, colorMatrix: FloatArray,
+        exposureGain: Float,
         posBuffer: FloatBuffer, texBuffer: FloatBuffer
     ) {
         GLES20.glUseProgram(program)
@@ -1125,6 +1272,7 @@ class GLRenderer {
         GLES20.glUniform1f(uWhiteLevelLoc, whiteLevel)
         GLES20.glUniform2f(uAWBGainsLoc, rVal, bVal)
         GLES20.glUniform1fv(uColorMatrixLoc, 9, colorMatrix, 0)
+        GLES20.glUniform1f(uExposureGainLoc, exposureGain)
 
         GLES20.glEnableVertexAttribArray(aPositionLoc)
         GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 8, posBuffer)

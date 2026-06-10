@@ -152,6 +152,7 @@ object DngExtractor {
                 val gGreenEven = frameBuf.float
                 val gGreenOdd = frameBuf.float
                 val gBlue = frameBuf.float
+                val postRawBoost = frameBuf.int
 
                 val rGain = max(0.0001f, gRed)
                 val gGain = max(0.0001f, (gGreenEven + gGreenOdd) / 2.0f)
@@ -213,7 +214,8 @@ object DngExtractor {
                     cm1, cm2, fm1, fm2, cal1, cal2,
                     ill1, ill2, baselineExp, noiseProfile,
                     lensIntrinsic, lensDistortion, lensAperture, lensFocalLength,
-                    deviceMake, deviceModel, preWidth, preHeight
+                    deviceMake, deviceModel, preWidth, preHeight,
+                    postRawBoost
                 )
 
                 frameCount++
@@ -236,7 +238,8 @@ object DngExtractor {
         lensIntrinsic: FloatArray, lensDistortion: FloatArray,
         lensAperture: Float, lensFocalLength: Float,
         deviceMake: String, deviceModel: String,
-        preWidth: Int, preHeight: Int
+        preWidth: Int, preHeight: Int,
+        postRawBoost: Int
     ) {
         FileOutputStream(file).use { fos ->
             val buf = ByteBuffer.allocate(16 * 1024 * 1024).order(ByteOrder.LITTLE_ENDIAN)
@@ -347,6 +350,15 @@ object DngExtractor {
 
             tags.add(DngTag(50727, 'r', 3, intArrayOf(1, 1, 1, 1, 1, 1))) // AnalogBalance (1,1,1)
             
+            // Combine baselineExp and postRawBoost into a single BaselineExposure tag
+            val baseExpVal = baselineExp[0].toDouble() / baselineExp[1].toDouble()
+            val boostMultiplier = postRawBoost.toDouble() / 100.0
+            val boostStops = if (boostMultiplier > 0.0) Math.log(boostMultiplier) / Math.log(2.0) else 0.0
+            val totalBaselineExp = baseExpVal + boostStops
+            val bExpNum = (totalBaselineExp * 100.0).toInt()
+            val bExpDen = 100
+            tags.add(DngTag(50730, 'S', 1, intArrayOf(bExpNum, bExpDen))) // BaselineExposure
+
             val uniqueId = byteArrayOf(1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16)
             tags.add(DngTag(50781, 'B', 16, uniqueId)) // RawDataUniqueID
             
