@@ -108,3 +108,13 @@ Contributions are welcome! If you'd like to help test or extract calibration pro
 ## 📄 License
 
 This project is licensed under the terms of the MIT License. See the [LICENSE](LICENSE) file for details.
+
+---
+
+## 📝 Changelog
+
+### Recent Changes
+- **ACEScct (AP1) Export Support:** Added the ability to export RAW videos into the ACEScct color space and AP1 gamut directly from the app.
+- **D50 White Point Adaptation:** Fixed a color balance issue by computing and using a mathematically correct D50-adapted `acesAp1FromXYZ` color transformation matrix, ensuring accurate, neutral white balance in ACEScct exports compared to standard Rec709 workflows.
+- **UI Improvements:** Updated the gallery export dialog to include the new ACEScct option with relevant descriptions.
+- **Shader Updates:** Added the ACEScct Optical Electro-Transfer Function (OETF) directly into the GPU shader (`VideoRendererService.kt`) for high-performance processing.

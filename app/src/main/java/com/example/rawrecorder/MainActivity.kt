@@ -56,6 +56,7 @@ import android.content.pm.ActivityInfo
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.example.rawrecorder.ui.theme.RawRecorderTheme
+import com.example.rawrecorder.gallery.VideoRendererService
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -102,6 +103,7 @@ class MainActivity : ComponentActivity() {
 
     private var hasCameraPermission by mutableStateOf(false)
     private var isRecording by mutableStateOf(false)
+    private var currentRecordingFile: File? = null
 
     private var availableLenses by mutableStateOf<List<CameraLensInfo>>(emptyList())
     private var selectedLens by mutableStateOf<CameraLensInfo?>(null)
@@ -606,8 +608,21 @@ class MainActivity : ComponentActivity() {
             0, 1, 1, 1, 0, 1,
             0, 1, 0, 1, 1, 1
         )
-        val baselineExpNum: Int
-        val baselineExpDen: Int
+        var baselineExpNum: Int = 0
+        var baselineExpDen: Int = 1
+        try {
+            val key = CameraCharacteristics::class.java.getField("SENSOR_INFO_BASELINE_EXPOSURE")
+            val rational = pChars.get(key.get(null) as android.hardware.camera2.CameraCharacteristics.Key<*>)
+            if (rational != null) {
+                val numMethod = rational.javaClass.getMethod("getNumerator")
+                val denMethod = rational.javaClass.getMethod("getDenominator")
+                baselineExpNum = numMethod.invoke(rational) as Int
+                baselineExpDen = denMethod.invoke(rational) as Int
+                Log.d("CAMERA_DEBUG", "Device baselineExposure: $baselineExpNum/$baselineExpDen = ${baselineExpNum.toFloat()/baselineExpDen} EV")
+            }
+        } catch (e: Exception) {
+            Log.d("CAMERA_DEBUG", "Baseline exposure not available via API: ${e.message}, using default 0")
+        }
         val noiseProfileArray = FloatArray(8)
 
         when (sensorType) {
@@ -618,8 +633,6 @@ class MainActivity : ComponentActivity() {
                 dynamicFm2 = intArrayOf(3806, 10000, 4501, 10000, 1336, 10000, 1773, 10000, 7842, 10000, 385, 10000, 652, 10000, 6, 10000, 7593, 10000)
                 ill1Val = 17
                 ill2Val = 21
-                baselineExpNum = 12
-                baselineExpDen = 100
                 floatArrayOf(
                     0.0004338437f, 4.3466407e-6f,
                     0.0002172339f, 2.2114516e-6f,
@@ -634,8 +647,6 @@ class MainActivity : ComponentActivity() {
                 dynamicFm2 = intArrayOf(5208, 10000, 3320, 10000, 1116, 10000, 2917, 10000, 6733, 10000, 350, 10000, 1702, 10000, 13, 10000, 6536, 10000)
                 ill1Val = 17
                 ill2Val = 21
-                baselineExpNum = 267
-                baselineExpDen = 100
                 floatArrayOf(
                     0.00017274475f, 6.8975623e-7f,
                     8.3773375e-5f, 3.2082875e-7f,
@@ -650,8 +661,6 @@ class MainActivity : ComponentActivity() {
                 dynamicFm2 = intArrayOf(3638, 10000, 4646, 10000, 1359, 10000, 1621, 10000, 7989, 10000, 390, 10000, 543, 10000, 32, 10000, 7676, 10000)
                 ill1Val = 17
                 ill2Val = 21
-                baselineExpNum = 0
-                baselineExpDen = 100
                 floatArrayOf(
                     2.0539945e-5f, 2.1160035e-7f,
                     1.4857906e-5f, 1.2181445e-7f,
@@ -666,8 +675,6 @@ class MainActivity : ComponentActivity() {
                 dynamicFm2 = intArrayOf(3666, 10000, 4641, 10000, 1335, 10000, 1639, 10000, 7979, 10000, 383, 10000, 477, 10000, 42, 10000, 7733, 10000)
                 ill1Val = 17
                 ill2Val = 21
-                baselineExpNum = 5
-                baselineExpDen = 100
                 floatArrayOf(
                     2.0539945e-5f, 2.1160035e-7f,
                     1.4857906e-5f, 1.2181445e-7f,
@@ -2192,6 +2199,19 @@ class MainActivity : ComponentActivity() {
                             rawSpoolerEngine?.stopRecording()
                             isRecording = false
                             updateRepeatingRequest()
+                            val recordedFile = currentRecordingFile
+                            currentRecordingFile = null
+                            if (recordedFile != null) {
+                                Thread {
+                                    Thread.sleep(500)
+                                    val docDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                                    val rawRecorderDir = File(docDir, "RawRecorder")
+                                    val previewDir = File(rawRecorderDir, recordedFile.nameWithoutExtension)
+                                    if (!previewDir.exists()) previewDir.mkdirs()
+                                    val previewFile = File(previewDir, "preview.jpg")
+                                    VideoRendererService.generatePreview(recordedFile, previewFile)
+                                }.start()
+                            }
                         } else {
                             val dir = if (usePrivateStorage) getExternalFilesDir(null) else Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
                             dir?.mkdirs()
@@ -2228,6 +2248,7 @@ class MainActivity : ComponentActivity() {
                             val nextIndex = maxIndex + 1
                             val fileName = String.format("%s_%04d.ayushraw", captureName, nextIndex)
                             val file = File(dir, fileName)
+                            currentRecordingFile = file
                             val orientation = getDngOrientation()
                             rawSpoolerEngine?.startRecording(file, selectedFps, orientation, useGoogleMetadata)
                             isRecording = true

@@ -35,16 +35,32 @@ import java.nio.FloatBuffer
 import kotlin.math.max
 import kotlin.math.abs
 
+enum class ColorSpace {
+    REC709,
+    CINEON_LOG,
+    ACES_AP1
+}
+
+enum class OutputGamut(val displayName: String) {
+    REC709("Rec.709"),
+    CINEON_LOG("Cineon Log"),
+    ACES_AP1("ACEScct (AP1)")
+}
+
+data class ExportConfig(
+    val outputGamut: OutputGamut = OutputGamut.REC709,
+    val targetBitrate: Int? = null,
+    val lutFilePath: String? = null
+)
+
 object VideoRendererService {
     private const val TAG = "VideoRendererService"
 
-    // Compose state variables for UI exposure
     var isRendering by mutableStateOf(false)
     var renderingPath by mutableStateOf("")
     var currentPhase by mutableStateOf("")
     var progressFraction by mutableStateOf(0f)
 
-    // --- 3x3 matrix helpers (row-major) ---
     private fun mat3Det(m: FloatArray): Float {
         return m[0]*(m[4]*m[8] - m[5]*m[7]) -
                m[1]*(m[3]*m[8] - m[5]*m[6]) +
@@ -68,7 +84,6 @@ object VideoRendererService {
         )
     }
 
-    /** C = A × B (both row-major 3×3) */
     private fun mat3Mul(a: FloatArray, b: FloatArray): FloatArray {
         val c = FloatArray(9)
         for (r in 0..2) for (col in 0..2) {
@@ -77,7 +92,6 @@ object VideoRendererService {
         return c
     }
 
-    /** result = M × v  (3×3 × 3×1) */
     private fun mat3MulVec(m: FloatArray, v: FloatArray): FloatArray {
         return floatArrayOf(
             m[0]*v[0] + m[1]*v[1] + m[2]*v[2],
@@ -86,7 +100,6 @@ object VideoRendererService {
         )
     }
 
-    /** Build diag(v) 3×3 */
     private fun mat3Diag(v: FloatArray): FloatArray {
         return floatArrayOf(
             v[0], 0f, 0f,
@@ -95,7 +108,6 @@ object VideoRendererService {
         )
     }
 
-    /** Parse a RATIONAL or SRATIONAL array (pairs of int) into a 3×3 float matrix. */
     private fun parseRationalMatrix(raw: IntArray): FloatArray {
         val m = FloatArray(9)
         for (i in 0 until 9) {
@@ -106,46 +118,31 @@ object VideoRendererService {
         return m
     }
 
-    private fun isMatrixValid(m: FloatArray): Boolean {
-        var allZeros = true
-        for (v in m) if (v != 0f) { allZeros = false; break }
-        if (allZeros) return false
-        // Check for identity-like (all diagonal 1, rest 0) – means "not set"
-        var isIdentity = true
-        for (i in 0 until 9) {
-            val expected = if (i == 0 || i == 4 || i == 8) 1f else 0f
-            if (m[i] != expected) { isIdentity = false; break }
-        }
-        // Identity IS valid – it just means no transform, which is fine
-        return true
-    }
+    private val srgbFromXYZ = floatArrayOf(
+         3.1338561f, -1.6168667f, -0.4906146f,
+        -0.9787684f,  1.9161415f,  0.0334540f,
+         0.0719453f, -0.2289914f,  1.4052427f
+    )
 
-    /**
-     * Build the combined camera-to-sRGB matrix using ColorMatrix-inverse approach,
-     * with interpolation between calibration illuminant 1 (StdA) and illuminant 2 (D65)
-     * based on the scene white balance.
-     *
-     *   outputRGB = sRGBfromXYZ × CM_interp⁻¹ × diag(chicken) × CC⁻¹ × white-balanced-camera-values
-     *
-     * The ColorMatrix-inverse approach (used by dcraw / Adobe) produces ~1.8x more
-     * saturated colors than the ForwardMatrix approach in the DNG spec.
-     *
-     * Interpolation weight derived from AWB gains:
-     *   Warm scene (rVal > 1, bVal < 1) → blend toward illuminant 1 (StdA)
-     *   Neutral/cool scene             → blend toward illuminant 2 (D65)
-     */
+    private val acesAp1FromXYZ = floatArrayOf(
+         1.5926160f, -0.3518512f, -0.2228826f,
+        -0.6759583f,  1.6393565f,  0.0151099f,
+         0.0199535f, -0.0225471f,  1.2159743f
+    )
+
+    private val p3FromXYZ = floatArrayOf(
+         0.8224847f, -0.1778620f, -0.0095358f,
+        -0.2588891f,  1.4266513f,  0.0549473f,
+         0.0210445f, -0.0624169f,  0.9607261f
+    )
+
     private fun buildCombinedColorMatrix(
         fm1Raw: IntArray, cm1Raw: IntArray, cal1Raw: IntArray,
         fm2Raw: IntArray, cm2Raw: IntArray, cal2Raw: IntArray,
-        rVal: Float, bVal: Float
+        rVal: Float, bVal: Float,
+        displayFromXYZ: FloatArray
     ): FloatArray {
         val d50White = floatArrayOf(0.9642f, 1.0000f, 0.8249f)
-
-        val sRGBfromXYZ = floatArrayOf(
-             3.1338561f, -1.6168667f, -0.4906146f,
-            -0.9787684f,  1.9161415f,  0.0334540f,
-             0.0719453f, -0.2289914f,  1.4052427f
-        )
 
         val camToXYZ1 = computeCameraToXYZ(fm1Raw, cm1Raw, cal1Raw, d50White)
         val camToXYZ2 = computeCameraToXYZ(fm2Raw, cm2Raw, cal2Raw, d50White)
@@ -158,23 +155,20 @@ object VideoRendererService {
             camToXYZ[i] = camToXYZ1[i] * (1f - blend) + camToXYZ2[i] * blend
         }
 
-        val combined = mat3Mul(sRGBfromXYZ, camToXYZ)
+        val combined = mat3Mul(displayFromXYZ, camToXYZ)
 
-        Log.d(TAG, "Combined color matrix (blend=${java.lang.String.format("%.3f", blend)}): [${combined.joinToString()}]")
+        val neutralR = combined[0] + combined[1] + combined[2]
+        val neutralG = combined[3] + combined[4] + combined[5]
+        val neutralB = combined[6] + combined[7] + combined[8]
+        val luminanceScale = 0.2126f * neutralR + 0.7152f * neutralG + 0.0722f * neutralB
+
+        if (luminanceScale > 1e-6f) {
+            for (i in 0 until 9) combined[i] /= luminanceScale
+        }
+
         return combined
     }
 
-    /**
-     * Compute camera-RGB → XYZ-D50 using ColorMatrix-inverse approach (dcraw-style).
-     *
-     *   camToXYZ = CM⁻¹ × diag(CM × D50_XYZ)
-     *
-     * The "chicken" normalization (CM × D50_XYZ) ensures [1,1,1] maps to D50_XYZ,
-     * preserving neutral white. This produces much more saturated colors than the
-     * ForwardMatrix approach (~1.8x more for typical camera primaries).
-     *
-     * Falls back to ForwardMatrix approach if ColorMatrix is unavailable.
-     */
     private fun computeCameraToXYZ(
         fmRaw: IntArray, cmRaw: IntArray, calRaw: IntArray, d50White: FloatArray
     ): FloatArray {
@@ -197,12 +191,9 @@ object VideoRendererService {
         if (CM.any { it != 0f }) {
             val cmInv = mat3Inv(CM)
             if (cmInv != null) {
-                // chicken = CM × D50_XYZ: camera RGB for D50 white
                 val chicken = mat3MulVec(CM, d50White)
-                // camToXYZ = CM⁻¹ × diag(chicken)  → maps [1,1,1] to D50_XYZ
                 camToXYZ = mat3Mul(cmInv, mat3Diag(chicken))
             } else {
-                // CM is singular, fall back to ForwardMatrix
                 val fmInv = mat3Inv(FM)
                 if (fmInv != null) {
                     val d = mat3MulVec(fmInv, d50White)
@@ -302,7 +293,7 @@ object VideoRendererService {
         }
     }
 
-    fun startHevcExport(context: Context, ayushrawPath: String) {
+    fun startHevcExport(context: Context, ayushrawPath: String, config: ExportConfig = ExportConfig()) {
         val file = File(ayushrawPath)
         if (!file.exists()) {
             Toast.makeText(context, "File not found", Toast.LENGTH_SHORT).show()
@@ -321,10 +312,13 @@ object VideoRendererService {
         currentPhase = "Exporting HEVC"
         progressFraction = 0f
 
-        Toast.makeText(context, "Starting GPU HEVC 10-bit export...", Toast.LENGTH_SHORT).show()
+        val profileName = config.outputGamut.displayName
+        val bitrateInfo = if (config.targetBitrate != null) "${config.targetBitrate / 1_000_000} Mbps" else "auto"
+        val lutInfo = if (config.lutFilePath != null) " + LUT" else ""
+        Toast.makeText(context, "Exporting $profileName ($bitrateInfo)$lutInfo...", Toast.LENGTH_SHORT).show()
 
         CoroutineScope(Dispatchers.IO).launch {
-            val success = exportAyushrawToHevc(context, file, outputFile) { progress, total ->
+            val success = exportAyushrawToHevc(context, file, outputFile, config) { progress, total ->
                 val totalVal = if (total > 0) total else 1
                 progressFraction = progress.toFloat() / totalVal.toFloat()
             }
@@ -333,15 +327,9 @@ object VideoRendererService {
                 MediaScannerConnection.scanFile(context, arrayOf(outputFile.absolutePath), null, null)
             }
 
-            // Delete original .ayushraw file after successful export
-            if (success && file.exists()) {
-                val deleted = file.delete()
-                Log.d(TAG, "Deleted source raw file after HEVC export: $deleted")
-            }
-
             withContext(Dispatchers.Main) {
                 if (success) {
-                    Toast.makeText(context, "HEVC exported successfully! RAW deleted.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(context, "HEVC exported ($profileName @ $bitrateInfo$lutInfo)", Toast.LENGTH_LONG).show()
                 } else {
                     Toast.makeText(context, "HEVC export failed.", Toast.LENGTH_SHORT).show()
                 }
@@ -352,10 +340,48 @@ object VideoRendererService {
         }
     }
 
+    private fun parseCubeLut(file: File): Pair<Int, FloatArray>? {
+        try {
+            val lines = file.readLines()
+            var lutSize = 0
+            val data = mutableListOf<Float>()
+
+            for (line in lines) {
+                val trimmed = line.trim()
+                when {
+                    trimmed.startsWith("LUT_3D_SIZE") -> {
+                        lutSize = trimmed.split("\\s+".toRegex())[1].toInt()
+                    }
+                    trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("TITLE") ||
+                    trimmed.startsWith("DOMAIN_MIN") || trimmed.startsWith("DOMAIN_MAX") -> {
+                        // skip
+                    }
+                    else -> {
+                        val values = trimmed.split("\\s+".toRegex()).mapNotNull { it.toFloatOrNull() }
+                        if (values.size == 3) {
+                            data.addAll(values)
+                        }
+                    }
+                }
+            }
+
+            if (lutSize == 0 || data.size != lutSize * lutSize * lutSize * 3) {
+                Log.e(TAG, "Invalid LUT: size=$lutSize, data.size=${data.size}, expected=${lutSize*lutSize*lutSize*3}")
+                return null
+            }
+
+            return Pair(lutSize, data.toFloatArray())
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to parse LUT: ${e.message}", e)
+            return null
+        }
+    }
+
     private suspend fun exportAyushrawToHevc(
         context: Context,
         inputFile: File,
         outputFile: File,
+        config: ExportConfig,
         onProgress: (Int, Int) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         var fis: FileInputStream? = null
@@ -366,6 +392,8 @@ object VideoRendererService {
         var success = false
         var muxerStarted = false
         var rawTextureId = 0
+        var lutTextureId = 0
+        var lutSize = 0
 
         try {
             fis = FileInputStream(inputFile)
@@ -420,13 +448,13 @@ object VideoRendererService {
 
             val totalFrames = if (payloadSize > 0) ((inputFile.length() - 1024) / (48 + payloadSize)).toInt() else 1
 
-            // MediaCodec requires even dimensions
             val encWidth = width and -2
             val encHeight = height and -2
             val targetFps = 30
-            val bitrate = (encWidth * encHeight * targetFps * 0.5f).toInt().coerceIn(10_000_000, 120_000_000)
+            val autoBitrate = (encWidth * encHeight * targetFps * 0.5f).toInt().coerceIn(10_000_000, 120_000_000)
+            val bitrate = config.targetBitrate?.coerceIn(500_000, 500_000_000) ?: autoBitrate
 
-            Log.d(TAG, "Export HEVC GPU Config: ${encWidth}x${encHeight} @ $targetFps FPS, Bitrate: ${bitrate / 1_000_000} Mbps")
+            Log.d(TAG, "Export HEVC GPU Config: ${encWidth}x${encHeight} @ $targetFps FPS, Bitrate: ${bitrate / 1_000_000} Mbps, Profile: ${config.outputGamut}")
 
             val mimeType = MediaFormat.MIMETYPE_VIDEO_HEVC
             codec = MediaCodec.createEncoderByType(mimeType)
@@ -435,12 +463,12 @@ object VideoRendererService {
             format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
             format.setInteger(MediaFormat.KEY_FRAME_RATE, targetFps)
             format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            format.setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
             format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.HEVCProfileMain10)
 
             codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             val inputSurface = codec.createInputSurface()
             
-            // Setup EGL surface and context wrapping MediaCodec surface
             codecSurface = CodecInputSurface(inputSurface)
             codecSurface.makeCurrent()
             
@@ -448,7 +476,6 @@ object VideoRendererService {
 
             muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-            // Set rotation metadata so portrait recordings display correctly
             val rotationDegrees = when (dngOrientationVal) {
                 3 -> 180
                 6 -> 90
@@ -457,26 +484,63 @@ object VideoRendererService {
             }
             if (rotationDegrees != 0) {
                 muxer.setOrientationHint(rotationDegrees)
-                Log.d(TAG, "Set HEVC orientation hint: $rotationDegrees degrees")
             }
 
-            // Setup GL renderer and shaders
             renderer = GLRenderer()
             renderer.init()
 
+            // Load LUT if specified
+            if (config.lutFilePath != null) {
+                currentPhase = "Loading LUT"
+                val lutFile = File(config.lutFilePath)
+                if (lutFile.exists() && lutFile.extension.lowercase() == "cube") {
+                    val lutData = parseCubeLut(lutFile)
+                    if (lutData != null) {
+                        lutSize = lutData.first
+                        val lutFloats = lutData.second
+                        Log.d(TAG, "Loaded LUT: ${lutSize}x${lutSize}x${lutSize}")
+
+                        val textureIds = IntArray(1)
+                        GLES20.glGenTextures(1, textureIds, 0)
+                        lutTextureId = textureIds[0]
+
+                        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTextureId)
+                        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+                        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+                        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+                        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+
+                        val lutBuffer = ByteBuffer.allocateDirect(lutFloats.size * 4)
+                            .order(ByteOrder.nativeOrder())
+                            .asFloatBuffer()
+                        lutBuffer.put(lutFloats)
+                        lutBuffer.position(0)
+
+                        // Upload as 2D texture: width = N*N (R,G dims), height = N (B dim)
+                        GLES30.glTexImage2D(
+                            GLES20.GL_TEXTURE_2D, 0, GLES30.GL_RGB16F,
+                            lutSize * lutSize, lutSize,
+                            0, GLES20.GL_RGB, GLES20.GL_FLOAT, lutBuffer
+                        )
+                        Log.d(TAG, "LUT texture uploaded: ${lutSize * lutSize}x$lutSize")
+                    } else {
+                        Log.e(TAG, "Failed to parse LUT file, continuing without LUT")
+                    }
+                } else {
+                    Log.e(TAG, "LUT file not found or invalid extension: ${config.lutFilePath}")
+                }
+            }
+
             val cfaTuple = when (cfaPattern) {
-                0 -> intArrayOf(0, 1, 1, 2) // RGGB
-                1 -> intArrayOf(1, 0, 2, 1) // GRBG
-                2 -> intArrayOf(1, 2, 0, 1) // GBRG
-                3 -> intArrayOf(2, 1, 1, 0) // BGGR
+                0 -> intArrayOf(0, 1, 1, 2)
+                1 -> intArrayOf(1, 0, 2, 1)
+                2 -> intArrayOf(1, 2, 0, 1)
+                3 -> intArrayOf(2, 1, 1, 0)
                 else -> intArrayOf(1, 2, 0, 1)
             }
 
-            // Build combined color matrix using DNG spec pipeline with illuminant interpolation
-            // Defer to first frame so we have AWB gains for the blend
             var combinedMatrix = FloatArray(9)
 
-            // Setup GL textures and coordinate buffers
             val textures = IntArray(1)
             GLES20.glGenTextures(1, textures, 0)
             rawTextureId = textures[0]
@@ -508,7 +572,6 @@ object VideoRendererService {
             val frameHeader = ByteArray(48)
             val payload = ByteArray(payloadSize)
             
-            // Preallocate direct buffer to upload payload texture
             val payloadBuffer = ByteBuffer.allocateDirect(payloadSize)
             payloadBuffer.order(ByteOrder.nativeOrder())
 
@@ -546,15 +609,15 @@ object VideoRendererService {
                         gotFrame = true
 
                         if (!matrixComputed) {
+                            val targetFromXYZ = if (config.outputGamut == OutputGamut.ACES_AP1) acesAp1FromXYZ else srgbFromXYZ
                             combinedMatrix = buildCombinedColorMatrix(
-                                fm1, cm1, cal1, fm2, cm2, cal2, rVal, bVal
+                                fm1, cm1, cal1, fm2, cm2, cal2, rVal, bVal, targetFromXYZ
                             )
                             matrixComputed = true
                         }
 
                         val cropStartRow = ((sourceHeight - height) / 2) and -2
                         
-                        // Upload payload to texture
                         payloadBuffer.clear()
                         payloadBuffer.put(payload)
                         payloadBuffer.position(0)
@@ -565,9 +628,14 @@ object VideoRendererService {
                             0, GLES30.GL_RED, GLES20.GL_UNSIGNED_BYTE, payloadBuffer
                         )
 
-                        // Render frame
                         val boostMultiplier = postRawBoost.toFloat() / 100f
-                        val exposureGain = boostMultiplier * 1.25f
+                        val baselineExp = if (baselineExpDen > 0) baselineExpNum.toFloat() / baselineExpDen.toFloat() else 0f
+                        val baselineExpScale = Math.pow(2.0, baselineExp.toDouble()).toFloat()
+                        val exposureGain = boostMultiplier * baselineExpScale
+
+                        if (frameCount == 0) {
+                            Log.d(TAG, "Frame0: boost=$postRawBoost, baseExp=$baselineExp, scale=$baselineExpScale, gain=$exposureGain, gamut=${config.outputGamut}, ${bitrate / 1_000_000}Mbps, matrix=[${String.format("%.3f,%.3f,%.3f", combinedMatrix[0], combinedMatrix[1], combinedMatrix[2])}]")
+                        }
 
                         renderer.drawFrame(
                             rawTextureId, rowStride.toFloat(), sourceHeight.toFloat(),
@@ -575,10 +643,10 @@ object VideoRendererService {
                             cfaTuple, blackLevelFloats, whiteLevel.toFloat(),
                             rVal, bVal, combinedMatrix,
                             exposureGain,
-                            posBuffer, texBuffer
+                            posBuffer, texBuffer,
+                            config.outputGamut.ordinal, lutTextureId, lutSize
                         )
 
-                        // Set presentation timestamp and swap buffer to encoder
                         codecSurface.setPresentationTime(timestampNs)
                         codecSurface.swapBuffers()
 
@@ -589,12 +657,10 @@ object VideoRendererService {
                     inputEndOfStream = true
                 }
 
-                // Drain output buffers
                 drainCodec(codec, muxer, bufferInfo, trackIndexRef, muxerStartedRef)
 
                 if (inputEndOfStream) {
                     codec.signalEndOfInputStream()
-                    // Keep draining until we get END_OF_STREAM flag
                     var eosReached = false
                     while (!eosReached) {
                         val outputBufferId = codec.dequeueOutputBuffer(bufferInfo, 10000L)
@@ -618,7 +684,6 @@ object VideoRendererService {
                                 eosReached = true
                             }
                         } else if (outputBufferId == MediaCodec.INFO_TRY_AGAIN_LATER) {
-                            // Break out if no output is ready yet, but keep loop until EOS is retrieved
                             Thread.sleep(10)
                         }
                     }
@@ -634,6 +699,12 @@ object VideoRendererService {
             try {
                 if (rawTextureId != 0) {
                     val textures = intArrayOf(rawTextureId)
+                    GLES20.glDeleteTextures(1, textures, 0)
+                }
+            } catch (e: Exception) {}
+            try {
+                if (lutTextureId != 0) {
+                    val textures = intArrayOf(lutTextureId)
                     GLES20.glDeleteTextures(1, textures, 0)
                 }
             } catch (e: Exception) {}
@@ -697,7 +768,7 @@ object VideoRendererService {
         }
     }
 
-    private fun generatePreview(inputFile: File, outputFile: File): Boolean {
+    fun generatePreview(inputFile: File, outputFile: File): Boolean {
         try {
             FileInputStream(inputFile).use { fis ->
                 val globalHeader = ByteArray(1024)
@@ -817,10 +888,10 @@ object VideoRendererService {
                 }
                 
                 val cfaTuple = when (cfaPattern) {
-                    0 -> intArrayOf(0, 1, 1, 2) // RGGB
-                    1 -> intArrayOf(1, 0, 2, 1) // GRBG
-                    2 -> intArrayOf(1, 2, 0, 1) // GBRG
-                    3 -> intArrayOf(2, 1, 1, 0) // BGGR
+                    0 -> intArrayOf(0, 1, 1, 2)
+                    1 -> intArrayOf(1, 0, 2, 1)
+                    2 -> intArrayOf(1, 2, 0, 1)
+                    3 -> intArrayOf(2, 1, 1, 0)
                     else -> intArrayOf(1, 2, 0, 1)
                 }
                 
@@ -841,8 +912,7 @@ object VideoRendererService {
                     }
                 }
                 
-                // Build combined color matrix using DNG spec pipeline with illuminant interpolation
-                val combinedMatrix = buildCombinedColorMatrix(fm1, cm1, cal1, fm2, cm2, cal2, rVal, bVal)
+                val combinedMatrix = buildCombinedColorMatrix(fm1, cm1, cal1, fm2, cm2, cal2, rVal, bVal, srgbFromXYZ)
 
                 val scale = 4
                 val previewWidth = width / scale
@@ -850,7 +920,9 @@ object VideoRendererService {
                 val colors = IntArray(previewWidth * previewHeight)
                 
                 val boostMultiplier = postRawBoost.toFloat() / 100f
-                val exposureGain = boostMultiplier * 1.25f
+                val baselineExp = if (baselineExpDen > 0) baselineExpNum.toFloat() / baselineExpDen.toFloat() else 0f
+                val baselineExpScale = Math.pow(2.0, baselineExp.toDouble()).toFloat()
+                val exposureGain = boostMultiplier * baselineExpScale
                 
                 for (py in 0 until previewHeight) {
                     val y = py * scale
@@ -899,13 +971,8 @@ object VideoRendererService {
                         var gout = (combinedMatrix[3]*r + combinedMatrix[4]*g + combinedMatrix[5]*b) * exposureGain
                         var bout = (combinedMatrix[6]*r + combinedMatrix[7]*g + combinedMatrix[8]*b) * exposureGain
                         
-                        // Apply ACES filmic tone mapping to match raw editor highlight roll-off
                         fun aces(x: Float): Float {
-                            val a = 2.51f
-                            val b = 0.03f
-                            val c = 2.43f
-                            val d = 0.59f
-                            val e = 0.14f
+                            val a = 2.51f; val b = 0.03f; val c = 2.43f; val d = 0.59f; val e = 0.14f
                             return ((x * (a * x + b)) / (x * (c * x + d) + e)).coerceIn(0f, 1f)
                         }
                         rout = aces(rout)
@@ -991,7 +1058,7 @@ class CodecInputSurface(private val surface: Surface) {
             EGL14.EGL_GREEN_SIZE, greenSize,
             EGL14.EGL_BLUE_SIZE, blueSize,
             EGL14.EGL_ALPHA_SIZE, alphaSize,
-            EGL14.EGL_RENDERABLE_TYPE, 0x0040, // EGL_OPENGL_ES3_BIT_KHR
+            EGL14.EGL_RENDERABLE_TYPE, 0x0040,
             EGL14.EGL_NONE
         )
         val configs = arrayOfNulls<EGLConfig>(1)
@@ -1047,6 +1114,10 @@ class GLRenderer {
     private var uAWBGainsLoc = -1
     private var uColorMatrixLoc = -1
     private var uExposureGainLoc = -1
+    private var uColorProfileLoc = -1
+    private var uUseLutLoc = -1
+    private var uLutTextureLoc = -1
+    private var uLutSizeLoc = -1
 
     private val vertexShaderCode = """
         #version 300 es
@@ -1077,6 +1148,10 @@ class GLRenderer {
         uniform vec2 uAWBGains;
         uniform float uColorMatrix[9];
         uniform float uExposureGain;
+        uniform float uColorProfile;
+        uniform int uUseLut;
+        uniform sampler2D uLutTexture;
+        uniform int uLutSize;
 
         float getByte(int bx, int by) {
             vec2 uv = (vec2(float(bx), float(by)) + 0.5) / vec2(uTexWidth, uTexHeight);
@@ -1106,8 +1181,6 @@ class GLRenderer {
             return b_pixel * 4.0 + float(lsb);
         }
 
-        // Rec.709 OETF (Optical-Electro Transfer Function)
-        // Maps linear light [0,1] to display signal [0,1]
         float rec709_oetf(float L) {
             L = clamp(L, 0.0, 1.0);
             if (L < 0.018) {
@@ -1115,6 +1188,39 @@ class GLRenderer {
             } else {
                 return 1.099 * pow(L, 0.45) - 0.099;
             }
+        }
+
+        float cineon_oetf(float L) {
+            float val = max(L, 0.0);
+            return (300.0 * log(val * 189.8627 + 2.0733) / log(10.0)) / 1023.0;
+        }
+
+        float acescct_oetf(float L) {
+            if (L <= 0.0078125) {
+                return 10.5402377416545 * L + 0.0729055341958355;
+            } else {
+                return (log2(L) + 9.72) / 17.52;
+            }
+        }
+
+        vec3 applyLut3D(vec3 color) {
+            float scale = float(uLutSize);
+            vec3 coord = clamp(color, 0.0, 1.0) * (scale - 1.0);
+
+            float b0 = floor(coord.b);
+            float bFrac = coord.b - b0;
+            float b1 = min(b0 + 1.0, scale - 1.0);
+
+            vec2 uv0 = vec2(
+                (coord.r * scale + coord.g + 0.5) / (scale * scale),
+                (b0 + 0.5) / scale
+            );
+            vec2 uv1 = vec2(uv0.x, (b1 + 0.5) / scale);
+
+            vec3 lut0 = texture(uLutTexture, uv0).rgb;
+            vec3 lut1 = texture(uLutTexture, uv1).rgb;
+
+            return mix(lut0, lut1, bFrac);
         }
 
         float getNorm(int px, int py, int ch) {
@@ -1177,28 +1283,47 @@ class GLRenderer {
                 }
             }
 
-            // Apply color matrix (camera → sRGB/Rec.709 linear)
             float rout = uColorMatrix[0]*r + uColorMatrix[1]*g + uColorMatrix[2]*b;
             float gout = uColorMatrix[3]*r + uColorMatrix[4]*g + uColorMatrix[5]*b;
             float bout = uColorMatrix[6]*r + uColorMatrix[7]*g + uColorMatrix[8]*b;
 
-            // Apply exposure gain boost
             rout *= uExposureGain;
             gout *= uExposureGain;
             bout *= uExposureGain;
 
-            // Apply ACES filmic tone mapping to prevent highlight clipping and wash-out
-            float tmA = 2.51;
-            float tmB = 0.03;
-            float tmC = 2.43;
-            float tmD = 0.59;
-            float tmE = 0.14;
-            rout = clamp((rout * (tmA * rout + tmB)) / (rout * (tmC * rout + tmD) + tmE), 0.0, 1.0);
-            gout = clamp((gout * (tmA * gout + tmB)) / (gout * (tmC * gout + tmD) + tmE), 0.0, 1.0);
-            bout = clamp((bout * (tmA * bout + tmB)) / (bout * (tmC * bout + tmD) + tmE), 0.0, 1.0);
+            if (uColorProfile > 1.5) {
+                rout = acescct_oetf(rout);
+                gout = acescct_oetf(gout);
+                bout = acescct_oetf(bout);
+            } else if (uColorProfile > 0.5) {
+                // For Cineon Log, apply logarithmic curve directly to linear scene values (no display tone mapping)
+                rout = cineon_oetf(rout);
+                gout = cineon_oetf(gout);
+                bout = cineon_oetf(bout);
+            } else {
+                // For Rec.709, apply ACES filmic display tone mapping to compress highlights, then Rec.709 OETF
+                float tmA = 2.51;
+                float tmB = 0.03;
+                float tmC = 2.43;
+                float tmD = 0.59;
+                float tmE = 0.14;
+                rout = clamp((rout * (tmA * rout + tmB)) / (rout * (tmC * rout + tmD) + tmE), 0.0, 1.0);
+                gout = clamp((gout * (tmA * gout + tmB)) / (gout * (tmC * gout + tmD) + tmE), 0.0, 1.0);
+                bout = clamp((bout * (tmA * bout + tmB)) / (bout * (tmC * bout + tmD) + tmE), 0.0, 1.0);
 
-            // Apply Rec.709 OETF (linear → gamma-encoded for display)
-            fragColor = vec4(rec709_oetf(rout), rec709_oetf(gout), rec709_oetf(bout), 1.0);
+                rout = rec709_oetf(rout);
+                gout = rec709_oetf(gout);
+                bout = rec709_oetf(bout);
+            }
+
+            if (uUseLut == 1) {
+                vec3 lutColor = applyLut3D(clamp(vec3(rout, gout, bout), 0.0, 1.0));
+                rout = lutColor.r;
+                gout = lutColor.g;
+                bout = lutColor.b;
+            }
+
+            fragColor = vec4(rout, gout, bout, 1.0);
         }
     """.trimIndent()
 
@@ -1232,12 +1357,18 @@ class GLRenderer {
         uAWBGainsLoc = GLES20.glGetUniformLocation(program, "uAWBGains")
         uColorMatrixLoc = GLES20.glGetUniformLocation(program, "uColorMatrix")
         uExposureGainLoc = GLES20.glGetUniformLocation(program, "uExposureGain")
+        uColorProfileLoc = GLES20.glGetUniformLocation(program, "uColorProfile")
+        uUseLutLoc = GLES20.glGetUniformLocation(program, "uUseLut")
+        uLutTextureLoc = GLES20.glGetUniformLocation(program, "uLutTexture")
+        uLutSizeLoc = GLES20.glGetUniformLocation(program, "uLutSize")
+        Log.d("GLRenderer", "Uniform locs: colorProfile=$uColorProfileLoc, exposureGain=$uExposureGainLoc, lut=$uUseLutLoc")
     }
 
     private fun loadShader(type: Int, shaderCode: String): Int {
         val shader = GLES20.glCreateShader(type)
         GLES20.glShaderSource(shader, shaderCode)
         GLES20.glCompileShader(shader)
+
         val compiled = IntArray(1)
         GLES20.glGetShaderiv(shader, GLES20.GL_COMPILE_STATUS, compiled, 0)
         if (compiled[0] != GLES20.GL_TRUE) {
@@ -1254,7 +1385,10 @@ class GLRenderer {
         cfaTuple: IntArray, blackLevel: FloatArray, whiteLevel: Float,
         rVal: Float, bVal: Float, colorMatrix: FloatArray,
         exposureGain: Float,
-        posBuffer: FloatBuffer, texBuffer: FloatBuffer
+        posBuffer: FloatBuffer, texBuffer: FloatBuffer,
+        colorProfile: Int = 0,
+        lutTextureId: Int = 0,
+        lutSize: Int = 0
     ) {
         GLES20.glUseProgram(program)
 
@@ -1273,6 +1407,17 @@ class GLRenderer {
         GLES20.glUniform2f(uAWBGainsLoc, rVal, bVal)
         GLES20.glUniform1fv(uColorMatrixLoc, 9, colorMatrix, 0)
         GLES20.glUniform1f(uExposureGainLoc, exposureGain)
+        GLES20.glUniform1f(uColorProfileLoc, colorProfile.toFloat())
+
+        if (lutTextureId != 0 && lutSize > 0) {
+            GLES20.glUniform1i(uUseLutLoc, 1)
+            GLES20.glActiveTexture(GLES20.GL_TEXTURE1)
+            GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, lutTextureId)
+            GLES20.glUniform1i(uLutTextureLoc, 1)
+            GLES20.glUniform1i(uLutSizeLoc, lutSize)
+        } else {
+            GLES20.glUniform1i(uUseLutLoc, 0)
+        }
 
         GLES20.glEnableVertexAttribArray(aPositionLoc)
         GLES20.glVertexAttribPointer(aPositionLoc, 2, GLES20.GL_FLOAT, false, 8, posBuffer)
