@@ -4,6 +4,12 @@ import sys
 import numpy as np
 import math
 
+try:
+    import lz4.block
+    HAS_LZ4 = True
+except ImportError:
+    HAS_LZ4 = False
+
 def process_file(file_path):
     print(f"Processing {file_path}...")
     output_dir = file_path + "_frames"
@@ -11,9 +17,18 @@ def process_file(file_path):
     
     with open(file_path, 'rb') as f:
         global_header = f.read(1024)
-        if len(global_header) < 1024 or global_header[:8] != b'AYUSHRAW':
-            print("Invalid global header")
+        magic = global_header[:8]
+        is_compressed = magic == b'AYUSHRC1'
+        if len(global_header) < 1024 or (magic != b'AYUSHRAW' and magic != b'AYUSHRC1'):
+            print(f"Invalid global header: magic={magic}")
             return
+        
+        if is_compressed and not HAS_LZ4:
+            print("Error: This file uses LZ4 compression but the 'lz4' Python package is not installed.")
+            print("Install it with: pip install lz4")
+            return
+        
+        print(f"Format: {magic.decode('ascii')} (compressed={is_compressed})")
             
         (width, height, row_stride, cfa_pattern, bit_depth) = struct.unpack('<5I', global_header[8:28])
         ill1, ill2 = struct.unpack('<2I', global_header[28:36])
@@ -110,9 +125,10 @@ def process_file(file_path):
             base_tags.append((50827, 'rational', 4, (int(lens_focal_length * 100), 100, int(lens_focal_length * 100), 100, int(lens_aperture * 100), 100, int(lens_aperture * 100), 100)))
 
         frame_idx = 0
+        frame_header_size = 56 if is_compressed else 48
         while True:
-            frame_header = f.read(48)
-            if len(frame_header) < 48:
+            frame_header = f.read(frame_header_size)
+            if len(frame_header) < frame_header_size:
                 break
                 
             (timestamp, shutter, iso, focus, idx, g_red, g_green_even, g_green_odd, g_blue) = struct.unpack('<qQififfff', frame_header[:44])
@@ -122,10 +138,39 @@ def process_file(file_path):
             g_green_odd = g_green_odd if g_green_odd > 0.001 else 1.0
             g_blue = g_blue if g_blue > 0.001 else 1.0
             
-            raw_payload = f.read(payload_size)
-            if len(raw_payload) < payload_size:
-                print(f"Warning: Reached end of file at frame {frame_idx} with incomplete payload!")
-                break
+            if is_compressed:
+                # Read post_raw_boost + compressed/original sizes from extended header
+                post_raw_boost = struct.unpack('<i', frame_header[44:48])[0]
+                compressed_size, original_size = struct.unpack('<2I', frame_header[48:56])
+                
+                compressed_data = f.read(compressed_size)
+                if len(compressed_data) < compressed_size:
+                    print(f"Warning: Reached end of file at frame {frame_idx} with incomplete compressed payload!")
+                    break
+                
+                raw_payload = lz4.block.decompress(compressed_data, uncompressed_size=original_size)
+                
+                # Unshuffle the RAW10 bytes
+                if original_size % 5 == 0:
+                    groups = original_size // 5
+                    unshuffled = bytearray(original_size)
+                    upper_part = raw_payload[:groups*4]
+                    lower_part = raw_payload[groups*4:]
+                    unshuffled[0::5] = upper_part[0::4]
+                    unshuffled[1::5] = upper_part[1::4]
+                    unshuffled[2::5] = upper_part[2::4]
+                    unshuffled[3::5] = upper_part[3::4]
+                    unshuffled[4::5] = lower_part
+                    raw_payload = bytes(unshuffled)
+
+                if frame_idx == 0:
+                    ratio = original_size / compressed_size
+                    print(f"Frame0 LZ4: {original_size}B -> {compressed_size}B ({ratio:.2f}x)")
+            else:
+                raw_payload = f.read(payload_size)
+                if len(raw_payload) < payload_size:
+                    print(f"Warning: Reached end of file at frame {frame_idx} with incomplete payload!")
+                    break
                 
             raw_data = np.frombuffer(raw_payload, dtype=np.uint8).reshape((source_height, row_stride))
             

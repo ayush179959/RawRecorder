@@ -257,10 +257,12 @@ class MainActivity : ComponentActivity() {
             putFloat("focusDistance", focusDistance)
             putBoolean("isPhotoMode", isPhotoMode)
             putString("stabilityMode", stabilityMode.name)
-            putString("selectedLensId", selectedLens?.physicalId)
-            putInt("selectedResolutionWidth", selectedResolution?.cropWidth ?: 0)
-            putInt("selectedResolutionHeight", selectedResolution?.cropHeight ?: 0)
-            putString("selectedResolutionAspect", selectedResolution?.aspectName ?: "4:3")
+            selectedLens?.physicalId?.let { putString("selectedLensId", it) }
+            selectedResolution?.let { res ->
+                putInt("selectedResolutionWidth", res.cropWidth)
+                putInt("selectedResolutionHeight", res.cropHeight)
+                putString("selectedResolutionAspect", res.aspectName)
+            }
             putInt("selectedFps", selectedFps)
             apply()
         }
@@ -302,6 +304,26 @@ class MainActivity : ComponentActivity() {
         isRecording = false
     }
 
+    private fun generateResolutionOptions(maxSize: android.util.Size): List<ResolutionOption> {
+        val standardWidths = listOf(3840, 3072, 2560, 2048, 1920)
+        val aspects = listOf(
+            Pair("16:9", 16.0 / 9.0),
+            Pair("2.35:1", 2.35),
+            Pair("2.39:1", 2.39)
+        )
+        val resOptions = mutableListOf<ResolutionOption>()
+        for (w in standardWidths) {
+            if (w > maxSize.width) continue
+            for (aspect in aspects) {
+                val h = (w / aspect.second).toInt() and -2
+                if (h <= maxSize.height) {
+                    resOptions.add(ResolutionOption(w, h, maxSize.width, maxSize.height, aspect.first))
+                }
+            }
+        }
+        return resOptions
+    }
+
     private fun initializeCameras() {
         val lenses = mutableListOf<CameraLensInfo>()
         val RAW_FORMAT = ImageFormat.RAW10 // CRITICAL: MIPI RAW10 for 60% bandwidth reduction
@@ -332,11 +354,8 @@ class MainActivity : ComponentActivity() {
                         val fpsRanges = pChars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
                         val fpsList = fpsRanges.map { it.upper }.distinct().sorted()
                         
-                        val resOptions = mutableListOf<ResolutionOption>()
-                        for (size in rawSizes) {
-                            resOptions.add(ResolutionOption(size.width, size.height, size.width, size.height, "4:3"))
-                            resOptions.add(ResolutionOption(size.width, size.width * 9 / 16, size.width, size.height, "16:9"))
-                        }
+                        val maxSize = rawSizes.maxByOrNull { it.width * it.height }
+                        val resOptions = if (maxSize != null) generateResolutionOptions(maxSize).toMutableList() else mutableListOf()
                         lenses.add(CameraLensInfo(pid, logicalId, name, fl, activeArray, resOptions, fpsList, cfa))
                     }
                 }
@@ -358,11 +377,8 @@ class MainActivity : ComponentActivity() {
                     val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
                     val fpsList = fpsRanges.map { it.upper }.distinct().sorted()
                     
-                    val resOptions = mutableListOf<ResolutionOption>()
-                    for (size in rawSizes) {
-                        resOptions.add(ResolutionOption(size.width, size.height, size.width, size.height, "4:3"))
-                        resOptions.add(ResolutionOption(size.width, size.width * 9 / 16, size.width, size.height, "16:9"))
-                    }
+                    val maxSize = rawSizes.maxByOrNull { it.width * it.height }
+                    val resOptions = if (maxSize != null) generateResolutionOptions(maxSize).toMutableList() else mutableListOf()
                     lenses.add(CameraLensInfo(logicalId, logicalId, name, fl, activeArray, resOptions, fpsList, cfa))
                 }
             }
@@ -377,14 +393,10 @@ class MainActivity : ComponentActivity() {
             val rawSizes = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)?.getOutputSizes(RAW_FORMAT)?.toList() ?: emptyList()
             val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
             val fpsList = fpsRanges.map { it.upper }.distinct().sorted()
-            val resOptions = mutableListOf<ResolutionOption>()
-            for (size in rawSizes) {
-                resOptions.add(ResolutionOption(size.width, size.height, size.width, size.height, "4:3"))
-                resOptions.add(ResolutionOption(size.width, size.width * 9 / 16, size.width, size.height, "16:9"))
-            }
+            val maxSize = rawSizes.maxByOrNull { it.width * it.height }
+            val resOptions = if (maxSize != null) generateResolutionOptions(maxSize).toMutableList() else mutableListOf()
             if (resOptions.isEmpty()) {
                 resOptions.add(ResolutionOption(activeArray.width(), activeArray.height(), activeArray.width(), activeArray.height(), "4:3"))
-                resOptions.add(ResolutionOption(activeArray.width(), activeArray.width() * 9 / 16, activeArray.width(), activeArray.height(), "16:9"))
             }
             lenses.add(CameraLensInfo(logicalId, logicalId, "W", 0f, activeArray, resOptions, fpsList, cfa))
         }

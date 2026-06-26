@@ -34,6 +34,7 @@ import java.nio.ByteOrder
 import java.nio.FloatBuffer
 import kotlin.math.max
 import kotlin.math.abs
+import com.example.rawrecorder.RawCompressor
 
 enum class ColorSpace {
     REC709,
@@ -255,9 +256,8 @@ object VideoRendererService {
         Toast.makeText(context, "Starting DNG extraction...", Toast.LENGTH_SHORT).show()
 
         CoroutineScope(Dispatchers.IO).launch {
-            val frameCount = DngExtractor.extractAyushrawToDngs(context, file, outputDir) { progress, total ->
-                val totalVal = if (total > 0) total else 1
-                progressFraction = progress.toFloat() / totalVal.toFloat()
+            val frameCount = DngExtractor.extractAyushrawToDngs(context, file, outputDir) { progress ->
+                progressFraction = progress
             }
 
             if (frameCount <= 0) {
@@ -293,6 +293,51 @@ object VideoRendererService {
         }
     }
 
+    fun startBatchHevcExport(context: Context, ayushrawPaths: List<String>, config: ExportConfig = ExportConfig()) {
+        if (ayushrawPaths.isEmpty()) return
+
+        isRendering = true
+        progressFraction = 0f
+
+        val profileName = config.outputGamut.displayName
+        val bitrateInfo = if (config.targetBitrate != null) "${config.targetBitrate / 1_000_000} Mbps" else "auto"
+        val lutInfo = if (config.lutFilePath != null) " + LUT" else ""
+        Toast.makeText(context, "Batch Exporting ${ayushrawPaths.size} files: $profileName ($bitrateInfo)$lutInfo...", Toast.LENGTH_SHORT).show()
+
+        CoroutineScope(Dispatchers.IO).launch {
+            for ((index, path) in ayushrawPaths.withIndex()) {
+                val file = File(path)
+                if (!file.exists()) continue
+                
+                renderingPath = file.absolutePath
+                currentPhase = "Exporting (${index + 1}/${ayushrawPaths.size})"
+                progressFraction = 0f
+                
+                val docDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                val rawRecorderDir = File(docDir, "RawRecorder")
+                if (!rawRecorderDir.exists()) {
+                    rawRecorderDir.mkdirs()
+                }
+                val outputFile = File(rawRecorderDir, file.nameWithoutExtension + ".mp4")
+                
+                try {
+                    exportAyushrawToHevc(context, file, outputFile, config) { progress ->
+                        progressFraction = progress
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to export $path", e)
+                }
+            }
+            
+            withContext(Dispatchers.Main) {
+                Toast.makeText(context, "Batch HEVC Export complete!", Toast.LENGTH_LONG).show()
+            }
+            
+            isRendering = false
+            progressFraction = 1.0f
+        }
+    }
+
     fun startHevcExport(context: Context, ayushrawPath: String, config: ExportConfig = ExportConfig()) {
         val file = File(ayushrawPath)
         if (!file.exists()) {
@@ -318,9 +363,13 @@ object VideoRendererService {
         Toast.makeText(context, "Exporting $profileName ($bitrateInfo)$lutInfo...", Toast.LENGTH_SHORT).show()
 
         CoroutineScope(Dispatchers.IO).launch {
-            val success = exportAyushrawToHevc(context, file, outputFile, config) { progress, total ->
-                val totalVal = if (total > 0) total else 1
-                progressFraction = progress.toFloat() / totalVal.toFloat()
+            val success = try {
+                exportAyushrawToHevc(context, file, outputFile, config) { progress ->
+                    progressFraction = progress
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Export failed", e)
+                false
             }
 
             if (success && outputFile.exists()) {
@@ -382,7 +431,7 @@ object VideoRendererService {
         inputFile: File,
         outputFile: File,
         config: ExportConfig,
-        onProgress: (Int, Int) -> Unit
+        onProgress: (Float) -> Unit
     ): Boolean = withContext(Dispatchers.IO) {
         var fis: FileInputStream? = null
         var codec: MediaCodec? = null
@@ -398,8 +447,14 @@ object VideoRendererService {
         try {
             fis = FileInputStream(inputFile)
             val globalHeader = ByteArray(1024)
-            if (!readFully(fis, globalHeader) || String(globalHeader, 0, 8, Charsets.US_ASCII) != "AYUSHRAW") {
+            if (!readFully(fis, globalHeader)) {
                 Log.e(TAG, "Invalid global header")
+                return@withContext false
+            }
+            val magic = String(globalHeader, 0, 8, Charsets.US_ASCII)
+            val isCompressed = magic == "AYUSHRC1"
+            if (magic != "AYUSHRAW" && !isCompressed) {
+                Log.e(TAG, "Invalid global header magic: $magic")
                 return@withContext false
             }
 
@@ -443,10 +498,13 @@ object VideoRendererService {
             val baselineExpNum = buffer.int
             val baselineExpDen = buffer.int
 
-            val sourceHeight = if (sourceHeightVal in 1..10000) sourceHeightVal else height
-            val payloadSize = sourceHeight * rowStride
+            var sourceHeight = if (sourceHeightVal in 1..10000) sourceHeightVal else height
+            val payloadSize = height * rowStride
+            val frameHeaderSize = if (isCompressed) 56 else 48
 
-            val totalFrames = if (payloadSize > 0) ((inputFile.length() - 1024) / (48 + payloadSize)).toInt() else 1
+            // For compressed files, frames have variable sizes so we can't compute totalFrames upfront
+            val totalFrames = if (isCompressed) -1
+                else if (payloadSize > 0) ((inputFile.length() - 1024) / (48 + payloadSize)).toInt() else 1
 
             val encWidth = width and -2
             val encHeight = height and -2
@@ -569,11 +627,21 @@ object VideoRendererService {
             val texBuffer = createFloatBuffer(quadTexCoords)
 
             val blackLevelFloats = FloatArray(4) { blPattern[it].toFloat() }
-            val frameHeader = ByteArray(48)
+            val frameHeader = ByteArray(frameHeaderSize)
             val payload = ByteArray(payloadSize)
             
             val payloadBuffer = ByteBuffer.allocateDirect(payloadSize)
             payloadBuffer.order(ByteOrder.nativeOrder())
+
+            // Allocate decompression buffers once for reuse (compressed files only)
+            var compressedDirectBuf: ByteBuffer? = null
+            var decompressedDirectBuf: ByteBuffer? = null
+            if (isCompressed) {
+                compressedDirectBuf = ByteBuffer.allocateDirect(payloadSize)
+                compressedDirectBuf.order(ByteOrder.nativeOrder())
+                decompressedDirectBuf = ByteBuffer.allocateDirect(payloadSize)
+                decompressedDirectBuf.order(ByteOrder.nativeOrder())
+            }
 
             var frameCount = 0
             val bufferInfo = MediaCodec.BufferInfo()
@@ -599,13 +667,49 @@ object VideoRendererService {
                     val gBlue = frameBuf.float
                     val postRawBoost = frameBuf.int
 
+                    val compressedSize = if (isCompressed) frameBuf.int else 0
+                    val originalSize = if (isCompressed) frameBuf.int else 0
+
+                    if (frameCount == 0 && isCompressed && originalSize > 0) {
+                        val actualRows = originalSize / rowStride
+                        if (actualRows < sourceHeight) {
+                            sourceHeight = actualRows
+                        }
+                    }
+
                     val rGain = max(0.0001f, gRed)
                     val gGain = max(0.0001f, (gGreenEven + gGreenOdd) / 2.0f)
                     val bGain = max(0.0001f, gBlue)
                     val rVal = gGain / rGain
                     val bVal = gGain / bGain
 
-                    if (readFully(fis, payload)) {
+                    val readOk = if (isCompressed) {
+                        // Read compressed payload and decompress
+                        val compressedPayload = ByteArray(compressedSize)
+                        if (readFully(fis, compressedPayload)) {
+                            compressedDirectBuf!!.clear()
+                            compressedDirectBuf.put(compressedPayload, 0, compressedSize)
+                            compressedDirectBuf.flip()
+                            decompressedDirectBuf!!.clear()
+                            val decompressedBytes = RawCompressor.decompress(
+                                compressedDirectBuf, compressedSize,
+                                decompressedDirectBuf, originalSize
+                            )
+                            if (decompressedBytes > 0) {
+                                decompressedDirectBuf.position(0)
+                                decompressedDirectBuf.limit(decompressedBytes)
+                                decompressedDirectBuf.get(payload, 0, decompressedBytes)
+                                true
+                            } else {
+                                Log.e(TAG, "LZ4 decompression failed for frame $frameCount")
+                                false
+                            }
+                        } else false
+                    } else {
+                        readFully(fis, payload)
+                    }
+
+                    if (readOk) {
                         gotFrame = true
 
                         if (!matrixComputed) {
@@ -616,7 +720,7 @@ object VideoRendererService {
                             matrixComputed = true
                         }
 
-                        val cropStartRow = ((sourceHeight - height) / 2) and -2
+                        val cropStartRow = 0
                         
                         payloadBuffer.clear()
                         payloadBuffer.put(payload)
@@ -624,7 +728,7 @@ object VideoRendererService {
                         
                         GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, rawTextureId)
                         GLES20.glTexImage2D(
-                            GLES20.GL_TEXTURE_2D, 0, GLES30.GL_R8, rowStride, sourceHeight,
+                            GLES20.GL_TEXTURE_2D, 0, GLES30.GL_R8, rowStride, height,
                             0, GLES30.GL_RED, GLES20.GL_UNSIGNED_BYTE, payloadBuffer
                         )
 
@@ -651,7 +755,8 @@ object VideoRendererService {
                         codecSurface.swapBuffers()
 
                         frameCount++
-                        onProgress(frameCount, totalFrames)
+                        val progressFraction = fis.channel.position().toFloat() / inputFile.length().toFloat()
+                        onProgress(progressFraction.coerceIn(0f, 1f))
                     }
                 } else {
                     inputEndOfStream = true
@@ -779,7 +884,9 @@ object VideoRendererService {
                     bytesRead += r
                 }
                 
-                if (String(globalHeader, 0, 8, Charsets.US_ASCII) != "AYUSHRAW") {
+                val magic = String(globalHeader, 0, 8, Charsets.US_ASCII)
+                val isCompressed = magic == "AYUSHRC1"
+                if (magic != "AYUSHRAW" && !isCompressed) {
                     return false
                 }
                 
@@ -823,13 +930,14 @@ object VideoRendererService {
                 val baselineExpNum = buffer.int
                 val baselineExpDen = buffer.int
                 
-                val sourceHeight = if (sourceHeightVal in 1..10000) sourceHeightVal else height
-                val payloadSize = sourceHeight * rowStride
+                var sourceHeight = if (sourceHeightVal in 1..10000) sourceHeightVal else height
+                val payloadSize = height * rowStride
+                val frameHeaderSize = if (isCompressed) 56 else 48
                 
-                val frameHeader = ByteArray(48)
+                val frameHeader = ByteArray(frameHeaderSize)
                 var fhBytesRead = 0
-                while (fhBytesRead < 48) {
-                    val r = fis.read(frameHeader, fhBytesRead, 48 - fhBytesRead)
+                while (fhBytesRead < frameHeaderSize) {
+                    val r = fis.read(frameHeader, fhBytesRead, frameHeaderSize - fhBytesRead)
                     if (r < 0) return false
                     fhBytesRead += r
                 }
@@ -845,6 +953,17 @@ object VideoRendererService {
                 val gGreenOdd = frameBuf.float
                 val gBlue = frameBuf.float
                 val postRawBoost = frameBuf.int
+
+                // Read compressed size fields from extended header (AYUSHRC1 only)
+                val compressedSize = if (isCompressed) frameBuf.int else 0
+                val originalSize = if (isCompressed) frameBuf.int else 0
+                
+                if (isCompressed && originalSize > 0) {
+                    val actualRows = originalSize / rowStride
+                    if (actualRows < sourceHeight) {
+                        sourceHeight = actualRows
+                    }
+                }
                 
                 val rGain = if (gRed > 0.0001f) gRed else 1.0f
                 val gGain = if ((gGreenEven + gGreenOdd) > 0.0001f) (gGreenEven + gGreenOdd) / 2.0f else 1.0f
@@ -853,15 +972,43 @@ object VideoRendererService {
                 val bVal = gGain / bGain
                 
                 val payload = ByteArray(payloadSize)
-                var plBytesRead = 0
-                while (plBytesRead < payloadSize) {
-                    val r = fis.read(payload, plBytesRead, payloadSize - plBytesRead)
-                    if (r < 0) return false
-                    plBytesRead += r
+                if (isCompressed) {
+                    // Read compressed payload and decompress
+                    val compressedPayload = ByteArray(compressedSize)
+                    var plBytesRead = 0
+                    while (plBytesRead < compressedSize) {
+                        val r = fis.read(compressedPayload, plBytesRead, compressedSize - plBytesRead)
+                        if (r < 0) return false
+                        plBytesRead += r
+                    }
+                    val compressedDirectBuf = ByteBuffer.allocateDirect(compressedSize)
+                    compressedDirectBuf.order(ByteOrder.nativeOrder())
+                    compressedDirectBuf.put(compressedPayload, 0, compressedSize)
+                    compressedDirectBuf.flip()
+                    val decompressedDirectBuf = ByteBuffer.allocateDirect(payloadSize)
+                    decompressedDirectBuf.order(ByteOrder.nativeOrder())
+                    val decompressedBytes = RawCompressor.decompress(
+                        compressedDirectBuf, compressedSize,
+                        decompressedDirectBuf, originalSize
+                    )
+                    if (decompressedBytes <= 0) {
+                        Log.e(TAG, "LZ4 decompression failed in preview")
+                        return false
+                    }
+                    decompressedDirectBuf.position(0)
+                    decompressedDirectBuf.limit(decompressedBytes)
+                    decompressedDirectBuf.get(payload, 0, decompressedBytes)
+                } else {
+                    var plBytesRead = 0
+                    while (plBytesRead < payloadSize) {
+                        val r = fis.read(payload, plBytesRead, payloadSize - plBytesRead)
+                        if (r < 0) return false
+                        plBytesRead += r
+                    }
                 }
                 
                 val rawGrid = ShortArray(width * height)
-                val cropStartRow = ((sourceHeight - height) / 2) and -2
+                val cropStartRow = 0
                 
                 var outIdx = 0
                 for (y in 0 until height) {

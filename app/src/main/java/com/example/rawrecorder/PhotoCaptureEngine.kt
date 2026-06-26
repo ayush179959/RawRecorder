@@ -44,7 +44,7 @@ object PhotoCaptureEngine {
                 if (!outputDir.exists()) outputDir.mkdirs()
                 
                 Log.d(TAG, "Extracting photo from ${tempAyushraw.absolutePath}")
-                val extractedFrames = DngExtractor.extractAyushrawToDngs(context, tempAyushraw, outputDir) { progress, total ->
+                val extractedFrames = DngExtractor.extractAyushrawToDngs(context, tempAyushraw, outputDir) { progress ->
                     // No-op for progress
                 }
                 
@@ -55,11 +55,11 @@ object PhotoCaptureEngine {
                 if (extractedFrames > 0) {
                     val dngFile = File(outputDir, "frame_00000.dng")
                     if (dngFile.exists()) {
-                        val dcimDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM)
-                        val cameraDir = File(dcimDir, "Camera")
-                        if (!cameraDir.exists()) cameraDir.mkdirs()
+                        val docDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS)
+                        val rawRecorderDir = File(docDir, "RawRecorder")
+                        if (!rawRecorderDir.exists()) rawRecorderDir.mkdirs()
                         
-                        val finalFile = File(cameraDir, "Photo_${System.currentTimeMillis()}.dng")
+                        val finalFile = File(rawRecorderDir, "Photo_${System.currentTimeMillis()}.dng")
                         val success = dngFile.renameTo(finalFile)
                         if (!success) {
                             try {
@@ -70,7 +70,7 @@ object PhotoCaptureEngine {
                                 }
                                 dngFile.delete()
                             } catch (e: Exception) {
-                                Log.e(TAG, "Failed to copy photo to DCIM/Camera", e)
+                                Log.e(TAG, "Failed to copy photo to Documents/RawRecorder", e)
                             }
                         }
                         

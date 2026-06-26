@@ -1,6 +1,7 @@
 package com.example.rawrecorder.gallery
 
 import android.util.Log
+import com.example.rawrecorder.RawCompressor
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -28,11 +29,41 @@ object DngExtractor {
         return if (this.endsWith("\u0000")) this else this + "\u0000"
     }
 
+    private fun loadLensShadingMap(ayushrawFile: File): Pair<IntArray, ByteBuffer>? {
+        val lsmFile = File(ayushrawFile.parentFile, ayushrawFile.nameWithoutExtension + ".lsm")
+        if (!lsmFile.exists()) return null
+        try {
+            val fis = java.io.FileInputStream(lsmFile)
+            val header = ByteArray(16)
+            if (fis.read(header) != 16) return null
+            val magic = String(header, 0, 8, Charsets.US_ASCII)
+            if (magic != "AYUSHLSM") return null
+            val bb = ByteBuffer.wrap(header, 8, 8).order(ByteOrder.LITTLE_ENDIAN)
+            val width = bb.int
+            val height = bb.int
+            val dataSize = width * height * 16 // 4 floats * 4 bytes
+            val data = ByteArray(dataSize)
+            var read = 0
+            while (read < dataSize) {
+                val r = fis.read(data, read, dataSize - read)
+                if (r < 0) break
+                read += r
+            }
+            val buf = ByteBuffer.allocateDirect(dataSize).order(ByteOrder.nativeOrder())
+            buf.put(data)
+            buf.position(0)
+            return Pair(intArrayOf(width, height), buf)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to load LSM", e)
+            return null
+        }
+    }
+
     suspend fun extractAyushrawToDngs(
         context: android.content.Context,
         file: File,
         outputDir: File,
-        onProgress: (Int, Int) -> Unit
+        onProgress: (Float) -> Unit
     ): Int = withContext(Dispatchers.IO) {
         if (!outputDir.exists()) outputDir.mkdirs()
 
@@ -41,10 +72,13 @@ object DngExtractor {
 
         FileInputStream(file).use { fis ->
             val readHeaderSuccess = readFully(fis, globalHeader)
-            if (!readHeaderSuccess || String(globalHeader, 0, 8, Charsets.US_ASCII) != "AYUSHRAW") {
-                Log.e(TAG, "Invalid global header")
+            val magic = String(globalHeader, 0, 8, Charsets.US_ASCII)
+            val isCompressed = magic == "AYUSHRC1"
+            if (!readHeaderSuccess || (magic != "AYUSHRAW" && magic != "AYUSHRC1")) {
+                Log.e(TAG, "Invalid global header: magic=$magic")
                 return@withContext 0
             }
+            Log.d(TAG, "Format: $magic (compressed=$isCompressed)")
 
             val buffer = ByteBuffer.wrap(globalHeader).order(ByteOrder.LITTLE_ENDIAN)
             buffer.position(8)
@@ -125,52 +159,107 @@ object DngExtractor {
                 1 -> intArrayOf(1, 0, 2, 1) // GRBG
                 2 -> intArrayOf(1, 2, 0, 1) // GBRG
                 3 -> intArrayOf(2, 1, 1, 0) // BGGR
-                else -> intArrayOf(1, 2, 0, 1)
+                else -> intArrayOf(1, 2, 0, 1) // Default to GBRG
             }
-
-            val payloadSize = sourceHeight * rowStride
-            val totalFrames = if (payloadSize > 0) ((file.length() - 1024) / (48 + payloadSize)).toInt() else 1
+            
+            val payloadSize = height * rowStride
+            val totalFrames = if (!isCompressed && payloadSize > 0) ((file.length() - 1024) / (48 + payloadSize)).toInt() else -1
             val outputBitDepth = 16
             val activeBlackLevel = blPattern
             val activeWhiteLevel = whiteLevel
-
-            val validWidth = width
-            val frameHeader = ByteArray(48)
             val payload = ByteArray(payloadSize)
+            
+            // Allocate decompression buffers once for reuse (compressed files only)
+            var compressedPayload: ByteArray? = null
+            var compressedDirectBuf: ByteBuffer? = null
+            var decompressedDirectBuf: ByteBuffer? = null
+            if (isCompressed) {
+                compressedPayload = ByteArray(payloadSize * 2)
+                compressedDirectBuf = ByteBuffer.allocateDirect(payloadSize * 2)
+                compressedDirectBuf.order(ByteOrder.nativeOrder())
+                decompressedDirectBuf = ByteBuffer.allocateDirect(payloadSize)
+                decompressedDirectBuf.order(ByteOrder.nativeOrder())
+            }
+
+            var frameCount = 0
+            val frameHeaderSize = if (isCompressed) 56 else 48
+            val validWidth = if (rowStride > 0) rowStride * 4 / 5 else width
 
             while (true) {
-                val headerReadSuccess = readFully(fis, frameHeader)
-                if (!headerReadSuccess) break
-
+                var frameHeader = ByteArray(frameHeaderSize)
+                if (!readFully(fis, frameHeader)) {
+                    break
+                }
+                
                 val frameBuf = ByteBuffer.wrap(frameHeader).order(ByteOrder.LITTLE_ENDIAN)
                 val timestamp = frameBuf.long
                 val shutter = frameBuf.long
                 val iso = frameBuf.int
                 val focus = frameBuf.float
-                val idx = frameBuf.int
-                val gRed = frameBuf.float
-                val gGreenEven = frameBuf.float
-                val gGreenOdd = frameBuf.float
-                val gBlue = frameBuf.float
+                val frameIdx = frameBuf.int
+                val rVal = frameBuf.float
+                val gEven = frameBuf.float
+                val gOdd = frameBuf.float
+                val bVal = frameBuf.float
                 val postRawBoost = frameBuf.int
-
-                val rGain = max(0.0001f, gRed)
-                val gGain = max(0.0001f, (gGreenEven + gGreenOdd) / 2.0f)
-                val bGain = max(0.0001f, gBlue)
-                val rVal = gGain / rGain
-                val bVal = gGain / bGain
-
-                val payloadReadSuccess = readFully(fis, payload)
-                if (!payloadReadSuccess) {
-                    Log.w(TAG, "Incomplete payload at frame $frameCount")
-                    break
+                
+                var compressedSize = 0
+                var originalSize = 0
+                if (isCompressed) {
+                    compressedSize = frameBuf.int
+                    originalSize = frameBuf.int
+                    
+                    if (compressedSize <= 0 || compressedSize > compressedPayload!!.size) {
+                        Log.e(TAG, "Invalid compressed size $compressedSize at frame $frameCount")
+                        break
+                    }
+                    if (originalSize != payloadSize) {
+                        Log.w(TAG, "Original size mismatch: $originalSize vs expected $payloadSize at frame $frameCount")
+                    }
+                    
+                    var cBytesRead = 0
+                    while (cBytesRead < compressedSize) {
+                        val r = fis.read(compressedPayload, cBytesRead, compressedSize - cBytesRead)
+                        if (r < 0) {
+                            Log.w(TAG, "Incomplete compressed payload at frame $frameCount")
+                            return@withContext frameCount
+                        }
+                        cBytesRead += r
+                    }
+                    
+                    compressedDirectBuf!!.clear()
+                    compressedDirectBuf.put(compressedPayload, 0, compressedSize)
+                    compressedDirectBuf.flip()
+                    
+                    decompressedDirectBuf!!.clear()
+                    val decompressedBytes = RawCompressor.decompress(
+                        compressedDirectBuf, compressedSize,
+                        decompressedDirectBuf, originalSize
+                    )
+                    
+                    if (decompressedBytes <= 0) {
+                        Log.e(TAG, "LZ4 decompression failed at frame $frameCount")
+                        break
+                    }
+                    
+                    // Copy decompressed data into payload ByteArray
+                    decompressedDirectBuf.position(0)
+                    decompressedDirectBuf.limit(decompressedBytes)
+                    decompressedDirectBuf.get(payload, 0, decompressedBytes)
+                } else {
+                    // Uncompressed: read payload directly
+                    val payloadReadSuccess = readFully(fis, payload)
+                    if (!payloadReadSuccess) {
+                        Log.w(TAG, "Incomplete payload at frame $frameCount")
+                        break
+                    }
                 }
 
                 // Write 16-bit uncompressed DNG format (2 bytes per pixel)
                 val packedSize = height * validWidth * 2
                 val packed = ByteArray(packedSize)
                 
-                val cropStartRow = ((sourceHeight - height) / 2) and -2
+                val cropStartRow = 0
                 
                 var inIdx = 0
                 var outIdx = 0
@@ -220,7 +309,8 @@ object DngExtractor {
 
                 frameCount++
                 withContext(Dispatchers.Main) {
-                    onProgress(frameCount, totalFrames)
+                    val progressFraction = fis.channel.position().toFloat() / file.length().toFloat()
+                    onProgress(progressFraction.coerceIn(0f, 1f))
                 }
             }
         }
@@ -372,6 +462,10 @@ object DngExtractor {
                 tags.add(DngTag(50827, 'S', 4, lensInfo)) // LensInfo
             }
 
+            if (opcodeBytes != null) {
+                tags.add(DngTag(51009, 'c', opcodeBytes.size, opcodeBytes)) // OpcodeList2
+            }
+
             tags.sortBy { it.id }
 
             val ifdSize = 2 + tags.size * 12 + 4
@@ -394,6 +488,7 @@ object DngExtractor {
                     'H' -> 3
                     'I' -> 4
                     'r' -> 5
+                    'c' -> 7
                     'S' -> 10
                     'f' -> 11
                     else -> 1
@@ -406,7 +501,7 @@ object DngExtractor {
                 buf.putInt(t.count)
                 
                 val byteSize = when (t.type) {
-                    'B' -> t.count
+                    'B', 'c' -> t.count
                     's' -> t.count
                     'H' -> t.count * 2
                     'I' -> t.count * 4

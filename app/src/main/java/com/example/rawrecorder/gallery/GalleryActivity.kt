@@ -14,6 +14,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -181,8 +182,10 @@ private fun playVideo(context: Context, file: File) {
 fun GalleryScreen(activity: GalleryActivity) {
     val context = activity as Context
     val galleryItems = remember { mutableStateListOf<GalleryItem>() }
+    val selectedItems = remember { mutableStateListOf<String>() }
     var deleteTarget by remember { mutableStateOf<GalleryItem?>(null) }
     var exportTarget by remember { mutableStateOf<GalleryItem?>(null) }
+    var batchExportTarget by remember { mutableStateOf<List<GalleryItem>?>(null) }
 
     var selectedLutUri by remember { mutableStateOf<String?>(null) }
     var selectedLutName by remember { mutableStateOf<String?>(null) }
@@ -249,8 +252,40 @@ fun GalleryScreen(activity: GalleryActivity) {
         )
     }
 
+    batchExportTarget?.let { items ->
+        ExportOptionsDialog(
+            lutName = selectedLutName,
+            onSelectLut = { lutPicker.launch(arrayOf("application/octet-stream", "text/plain", "*/*")) },
+            onClearLut = { selectedLutUri = null; selectedLutName = null },
+            onDismiss = { batchExportTarget = null },
+            onExport = { config ->
+                val paths = items.mapNotNull { it.rawFile?.absolutePath }
+                VideoRendererService.startBatchHevcExport(context, paths, config)
+                batchExportTarget = null
+                selectedItems.clear()
+            }
+        )
+    }
+
     Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-        Text("GALLERY", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        if (selectedItems.isNotEmpty()) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("${selectedItems.size} Selected", color = Color.White, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+                Row {
+                    Button(onClick = { selectedItems.clear() }, colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)) {
+                        Text("Cancel")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(onClick = { 
+                        batchExportTarget = galleryItems.filter { it.id in selectedItems } 
+                    }, colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))) {
+                        Text("Export")
+                    }
+                }
+            }
+        } else {
+            Text("GALLERY", color = Color.White, fontSize = 24.sp, fontWeight = FontWeight.Bold)
+        }
         Spacer(modifier = Modifier.height(16.dp))
 
         if (galleryItems.isEmpty()) {
@@ -262,6 +297,17 @@ fun GalleryScreen(activity: GalleryActivity) {
                 items(galleryItems, key = { it.id }) { item ->
                     GalleryCard(
                         item = item,
+                        isSelected = selectedItems.contains(item.id),
+                        onLongPress = {
+                            if (selectedItems.contains(item.id)) selectedItems.remove(item.id)
+                            else selectedItems.add(item.id)
+                        },
+                        onClick = {
+                            if (selectedItems.isNotEmpty()) {
+                                if (selectedItems.contains(item.id)) selectedItems.remove(item.id)
+                                else selectedItems.add(item.id)
+                            }
+                        },
                         onPlay = { item.hevcFile?.let { playVideo(context, it) } },
                         onDngExport = {
                             item.rawFile?.let { f ->
@@ -277,9 +323,13 @@ fun GalleryScreen(activity: GalleryActivity) {
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 fun GalleryCard(
     item: GalleryItem,
+    isSelected: Boolean,
+    onLongPress: () -> Unit,
+    onClick: () -> Unit,
     onPlay: () -> Unit,
     onDngExport: () -> Unit,
     onHevcExport: () -> Unit,
@@ -291,8 +341,12 @@ fun GalleryCard(
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(vertical = 4.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1A1A1A)),
+            .padding(vertical = 4.dp)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongPress
+            ),
+        colors = CardDefaults.cardColors(containerColor = if (isSelected) Color(0xFF2A3A4A) else Color(0xFF1A1A1A)),
         shape = RoundedCornerShape(8.dp)
     ) {
         Row(

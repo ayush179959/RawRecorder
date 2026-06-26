@@ -3,11 +3,15 @@ package com.example.rawrecorder
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.util.concurrent.ArrayBlockingQueue
+import kotlin.concurrent.thread
+import android.hardware.camera2.params.LensShadingMap
 
 class RawSpoolerEngine(
     private val width: Int,
@@ -41,15 +45,43 @@ class RawSpoolerEngine(
     private val preWidth: Int,
     private val preHeight: Int
 ) {
+    private val TAG = "RawSpoolerEngine"
+    
     private var handlerThread: HandlerThread? = null
     private var handler: Handler? = null
     
     private var fileChannel: FileChannel? = null
-    private var isRecording = false
+    @Volatile private var isRecording = false
     private var isSingleFrame = false
     private var frameCount = 0
+    
+    // Producer-Consumer multi-threading
+    private val QUEUE_CAPACITY = 8
+    private var freeQueue: ArrayBlockingQueue<ByteBuffer>? = null
+    private var frameQueue: ArrayBlockingQueue<FrameData>? = null
+    private var compressorThread: Thread? = null
+    private var compressionOutputBuffer: ByteBuffer? = null
+    
+    private var currentFile: File? = null
+    private var lensShadingMapSaved = false
 
-    fun isRecording(): Boolean = isRecording
+    private class FrameData(
+        val timestamp: Long,
+        val shutter: Long,
+        val iso: Int,
+        val focus: Float,
+        val frameIndex: Int,
+        val awbR: Float,
+        val awbGEven: Float,
+        val awbGOdd: Float,
+        val awbB: Float,
+        val postRawBoost: Int,
+        val expectedBytes: Int,
+        val buffer: ByteBuffer?,
+        val isPoisonPill: Boolean = false
+    )
+
+    fun isRecording(): Boolean = isRecording || fileChannel != null || compressorThread?.isAlive == true
     
     private var lastImageTimestamp = 0L
     private var droppedFramesCount = 0
@@ -76,6 +108,8 @@ class RawSpoolerEngine(
     fun getDroppedFrames(): Int = droppedFramesCount
     
     fun startRecording(file: File, fps: Int, dngOrientation: Int, useGoogleMetadata: Boolean, singleFrame: Boolean = false) {
+        currentFile = file
+        lensShadingMapSaved = false
         isSingleFrame = singleFrame
         frameCount = 0
         lastImageTimestamp = 0L
@@ -85,7 +119,7 @@ class RawSpoolerEngine(
         
         val globalHeaderBuffer = ByteBuffer.allocateDirect(1024)
         globalHeaderBuffer.order(ByteOrder.LITTLE_ENDIAN)
-        globalHeaderBuffer.put("AYUSHRAW".toByteArray())
+        globalHeaderBuffer.put("AYUSHRC1".toByteArray()) // Compressed format v1
         globalHeaderBuffer.putInt(width)
         globalHeaderBuffer.putInt(height)
         globalHeaderBuffer.putInt(0) // Will be updated to rowStride dynamically on first frame
@@ -151,14 +185,32 @@ class RawSpoolerEngine(
         
         globalHeaderBuffer.position(0)
         fileChannel?.write(globalHeaderBuffer)
+        
+        freeQueue = ArrayBlockingQueue(QUEUE_CAPACITY)
+        frameQueue = ArrayBlockingQueue(QUEUE_CAPACITY)
         isRecording = true
+        
+        compressorThread = thread(start = true, name = "CompressorThread") {
+            runCompressorLoop()
+        }
     }
     
     fun stopRecording() {
+        if (!isRecording) return
         isRecording = false
+        
+        try {
+            frameQueue?.put(FrameData(0, 0, 0, 0f, 0, 0f, 0f, 0f, 0f, 0, 0, null, true))
+        } catch (e: Exception) {}
+        
         handler?.post {
+            compressorThread?.join(2000)
             fileChannel?.close()
             fileChannel = null
+            
+            freeQueue?.clear()
+            frameQueue?.clear()
+            compressionOutputBuffer = null
         }
     }
     
@@ -175,10 +227,12 @@ class RawSpoolerEngine(
         liveFocus = focus
     }
     
+
+    
     val imageAvailableListener = ImageReader.OnImageAvailableListener { reader ->
         val image = reader.acquireNextImage() ?: return@OnImageAvailableListener
         
-        if (!isRecording || fileChannel == null) {
+        if (!isRecording || fileChannel == null || freeQueue == null || frameQueue == null) {
             image.close()
             return@OnImageAvailableListener
         }
@@ -197,7 +251,19 @@ class RawSpoolerEngine(
         }
         lastImageTimestamp = ts
         
+        val cropStartRow = ((sourceHeight - height) / 2) and -2
+        val startOffset = cropStartRow * rowStride
+        val expectedBytes = height * rowStride
+        val actualBytes = pixelBuffer.remaining()
+        
         if (frameCount == 0) {
+            // Allocate the buffer pool
+            for (i in 0 until QUEUE_CAPACITY) {
+                val buf = ByteBuffer.allocateDirect(expectedBytes)
+                buf.order(ByteOrder.nativeOrder())
+                freeQueue!!.add(buf)
+            }
+            
             val strideBuffer = ByteBuffer.allocateDirect(4)
             strideBuffer.order(ByteOrder.LITTLE_ENDIAN)
             strideBuffer.putInt(rowStride)
@@ -207,33 +273,54 @@ class RawSpoolerEngine(
             fileChannel?.position(1024)
         }
         
-        val frameHeader = ByteBuffer.allocateDirect(48)
-        frameHeader.order(ByteOrder.LITTLE_ENDIAN)
-        frameHeader.putLong(ts)
-        frameHeader.putLong(liveShutter)
-        frameHeader.putInt(liveIso)
-        frameHeader.putFloat(liveFocus)
-        frameHeader.putInt(frameCount)
-        frameHeader.putFloat(liveAwbR)
-        frameHeader.putFloat(liveAwbG_even)
-        frameHeader.putFloat(liveAwbG_odd)
-        frameHeader.putFloat(liveAwbB)
-        frameHeader.putInt(livePostRawBoost)
-        frameHeader.position(0)
+        // Take a free buffer
+        val inputBuf = freeQueue!!.poll()
+        if (inputBuf == null) {
+            Log.w(TAG, "Frame dropped! Compressor queue full.")
+            droppedFramesCount++
+            image.close()
+            return@OnImageAvailableListener
+        }
         
-        fileChannel?.write(frameHeader)
+        inputBuf.clear()
         
-        // Write the FULL buffer for RAW10. No zero-copy cropping!
-        val expectedBytes = height * rowStride
-        val actualBytes = pixelBuffer.remaining()
+        val originalLimit = pixelBuffer.limit()
+        if (actualBytes >= startOffset + expectedBytes) {
+            pixelBuffer.position(startOffset)
+            pixelBuffer.limit(startOffset + expectedBytes)
+            inputBuf.put(pixelBuffer)
+        } else if (actualBytes > startOffset) {
+            pixelBuffer.position(startOffset)
+            inputBuf.put(pixelBuffer)
+        }
         
-        fileChannel?.write(pixelBuffer)
+        pixelBuffer.limit(originalLimit)
         
-        // Buffer capacity might be slightly less than height*stride because the LAST row might drop trailing padding.
-        if (actualBytes < expectedBytes) {
-            val diff = expectedBytes - actualBytes
-            val padding = ByteBuffer.allocateDirect(diff)
-            fileChannel?.write(padding)
+        if (inputBuf.position() < expectedBytes) {
+            val diff = expectedBytes - inputBuf.position()
+            for (i in 0 until diff) inputBuf.put(0.toByte())
+        }
+        inputBuf.flip()
+        
+        val frameData = FrameData(
+            timestamp = ts,
+            shutter = liveShutter,
+            iso = liveIso,
+            focus = liveFocus,
+            frameIndex = frameCount,
+            awbR = liveAwbR,
+            awbGEven = liveAwbG_even,
+            awbGOdd = liveAwbG_odd,
+            awbB = liveAwbB,
+            postRawBoost = livePostRawBoost,
+            expectedBytes = expectedBytes,
+            buffer = inputBuf
+        )
+        
+        try {
+            frameQueue!!.put(frameData)
+        } catch (e: Exception) {
+            freeQueue!!.put(inputBuf)
         }
         
         image.close()
@@ -241,6 +328,61 @@ class RawSpoolerEngine(
         
         if (isSingleFrame) {
             stopRecording()
+        }
+    }
+
+    private fun writeFrameHeader(frame: FrameData, compressedSize: Int, originalSize: Int) {
+        val frameHeader = ByteBuffer.allocateDirect(56)
+        frameHeader.order(ByteOrder.LITTLE_ENDIAN)
+        frameHeader.putLong(frame.timestamp)
+        frameHeader.putLong(frame.shutter)
+        frameHeader.putInt(frame.iso)
+        frameHeader.putFloat(frame.focus)
+        frameHeader.putInt(frame.frameIndex)
+        frameHeader.putFloat(frame.awbR)
+        frameHeader.putFloat(frame.awbGEven)
+        frameHeader.putFloat(frame.awbGOdd)
+        frameHeader.putFloat(frame.awbB)
+        frameHeader.putInt(frame.postRawBoost)
+        frameHeader.putInt(compressedSize)
+        frameHeader.putInt(originalSize)
+        frameHeader.position(0)
+        fileChannel?.write(frameHeader)
+    }
+
+    private fun runCompressorLoop() {
+        while (true) {
+            val frame = frameQueue?.take() ?: break
+            if (frame.isPoisonPill) {
+                break
+            }
+            
+            if (compressionOutputBuffer == null) {
+                val compressBound = RawCompressor.compressBound(frame.expectedBytes)
+                compressionOutputBuffer = ByteBuffer.allocateDirect(compressBound)
+                compressionOutputBuffer!!.order(ByteOrder.nativeOrder())
+                Log.d(TAG, "LZ4 thread started, buffer bound: $compressBound")
+            }
+            
+            val outBuf = compressionOutputBuffer!!
+            outBuf.clear()
+            val compressedSize = RawCompressor.compress(frame.buffer!!, frame.expectedBytes, outBuf)
+            
+            if (compressedSize <= 0) {
+                Log.w(TAG, "LZ4 compression failed for frame ${frame.frameIndex}")
+                frame.buffer.position(0)
+                writeFrameHeader(frame, frame.expectedBytes, frame.expectedBytes)
+                frame.buffer.limit(frame.expectedBytes)
+                fileChannel?.write(frame.buffer)
+            } else {
+                writeFrameHeader(frame, compressedSize, frame.expectedBytes)
+                outBuf.position(0)
+                outBuf.limit(compressedSize)
+                fileChannel?.write(outBuf)
+            }
+            
+            // Return buffer back to the pool
+            freeQueue?.put(frame.buffer)
         }
     }
 
